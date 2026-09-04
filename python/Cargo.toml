@@ -1,0 +1,15 @@
+[package]
+name = "decayfmt-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for decayfmt, the file format where decay is a first-class property."
+license = "MIT"
+publish = false
+
+[lib]
+name = "decayfmt_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+decayfmt-core = { path = "..", package = "decayfmt" }
+pyo3 = { version = "0.29", features = ["abi3-py311"] }

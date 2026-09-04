@@ -9,6 +9,7 @@
 use crate::error::DecayError;
 use crate::format::{FileType, Header};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 /// Decodes a source image's bytes into its pixel dimensions and a raw RGBA payload.
@@ -17,7 +18,7 @@ use std::path::Path;
 /// reduced here to raw RGBA, four bytes per pixel, which is exactly what the
 /// decayfmt payload stores. The dimensions are returned alongside so the header can
 /// record them; the payload is the pixel data only and does not encode its own size.
-fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<u8>), DecayError> {
+pub fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<u8>), DecayError> {
     let decoded =
         image::load_from_memory(source_bytes).map_err(|error| DecayError::ImageDecode {
             context: format!("encode: decode image '{}': {}", input.display(), error),
@@ -32,7 +33,7 @@ fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<u8>)
 /// The payload is stored as raw UTF-8 bytes exactly as read. Invalid UTF-8 is
 /// refused at encode time so that only well-formed text ever enters the format;
 /// the later corruption at open time is what may break that validity.
-fn text_payload(source_bytes: Vec<u8>) -> Result<Vec<u8>, DecayError> {
+pub fn text_payload(source_bytes: Vec<u8>) -> Result<Vec<u8>, DecayError> {
     match std::str::from_utf8(&source_bytes) {
         Ok(_) => Ok(source_bytes),
         Err(_) => Err(DecayError::InvalidUtf8),
@@ -42,16 +43,17 @@ fn text_payload(source_bytes: Vec<u8>) -> Result<Vec<u8>, DecayError> {
 /// Writes the header and raw payload to the output path as a single file.
 ///
 /// The header is written exactly once, here, and is never rewritten afterward.
-/// The payload follows immediately after the fixed 16-byte header.
-fn write_decayfmt(output: &Path, header: Header, payload: &[u8]) -> Result<(), DecayError> {
-    let header_bytes = header.write();
-    let mut file_bytes = Vec::with_capacity(header_bytes.len() + payload.len());
-    file_bytes.extend_from_slice(&header_bytes);
-    file_bytes.extend_from_slice(payload);
-    fs::write(output, &file_bytes).map_err(|error| DecayError::Io {
+/// The payload follows immediately after the fixed 16-byte header. The two are
+/// written with two calls so the payload is never copied into a second full-size
+/// buffer; the bytes on disk are identical to writing one concatenated buffer.
+pub fn write_decayfmt(output: &Path, header: Header, payload: &[u8]) -> Result<(), DecayError> {
+    let write_error = |error| DecayError::Io {
         context: format!("encode: write output '{}'", output.display()),
         source: error,
-    })
+    };
+    let mut file = fs::File::create(output).map_err(write_error)?;
+    file.write_all(&header.write()).map_err(write_error)?;
+    file.write_all(payload).map_err(write_error)
 }
 
 /// Encodes a source file at `input` into a decayfmt file at `output`.
@@ -64,6 +66,9 @@ fn write_decayfmt(output: &Path, header: Header, payload: &[u8]) -> Result<(), D
 /// are written out. No corruption is applied; the produced file is clean and parses
 /// cleanly via format.rs. The value of x is not stored; it lives only in the filename.
 pub fn encode_file(input: &Path, output: &Path) -> Result<(), DecayError> {
+    // Parse the output name first, before any read: an output name that could
+    // never be opened is refused rather than producing a permanently unopenable
+    // file.
     let (file_type, _x) = crate::format::parse_filename(output)?;
 
     let source_bytes = fs::read(input).map_err(|error| DecayError::Io {
@@ -71,9 +76,32 @@ pub fn encode_file(input: &Path, output: &Path) -> Result<(), DecayError> {
         source: error,
     })?;
 
+    build_and_write(file_type, source_bytes, input, output)
+}
+
+/// Encodes in-memory source bytes into a decayfmt file at `output`.
+///
+/// The bytes are treated as a source file: decoded to raw RGBA for images and
+/// validated as UTF-8 for text, exactly as `encode_file` treats a file on disk.
+/// The payload type and x come from the output filename, as always.
+pub fn encode_bytes(source: &[u8], output: &Path) -> Result<(), DecayError> {
+    let (file_type, _x) = crate::format::parse_filename(output)?;
+    build_and_write(file_type, source.to_vec(), output, output)
+}
+
+/// Turns already-read source bytes into a header and payload and writes them out.
+///
+/// `source_path` names the source only for error message context; the bytes have
+/// already been read by the caller.
+fn build_and_write(
+    file_type: FileType,
+    source_bytes: Vec<u8>,
+    source_path: &Path,
+    output: &Path,
+) -> Result<(), DecayError> {
     let (header, payload) = match file_type {
         FileType::Image => {
-            let (width, height, payload) = decode_image(&source_bytes, input)?;
+            let (width, height, payload) = decode_image(&source_bytes, source_path)?;
             (Header::for_image(width, height), payload)
         }
         FileType::Text => (Header::for_text(), text_payload(source_bytes)?),

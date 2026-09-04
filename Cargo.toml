@@ -12,8 +12,25 @@ exclude = ["assets/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-image = "0.25"
+image = { version = "0.25", default-features = false, features = [
+    "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm",
+    "qoi", "tga", "tiff", "webp",
+] }
 rand = "0.8"
+rayon = "1"
 
 [profile.release]
 strip = true
+
+[[bench]]
+name = "corrupt"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[workspace]
+members = ["python"]
+default-members = ["."]
+resolver = "2"

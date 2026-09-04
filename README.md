@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/aravpanwar/decayfmt/actions/workflows/ci.yml/badge.svg)](https://github.com/aravpanwar/decayfmt/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/decayfmt.svg)](https://crates.io/crates/decayfmt)
+[![PyPI](https://img.shields.io/pypi/v/decayfmt-py.svg)](https://pypi.org/project/decayfmt-py/)
 
 _Featured in [This Week in Rust #660](https://this-week-in-rust.org/blog/2026/07/15/this-week-in-rust-660/)._
 
@@ -175,6 +176,61 @@ decayfmt open note.tdcy7
 ```
 
 `x` is read from the filename, so renaming the file changes how hard the next open hits.
+
+## Python
+
+The same library is available from Python as the `decayfmt` package — same format,
+same statistics, same errors as the CLI:
+
+```
+pip install decayfmt-py
+```
+
+```python
+import decayfmt
+
+decayfmt.encode_file("notes.txt", "notes.tdcy5")
+
+# Each open permanently corrupts the file on disk.
+for _ in range(5):
+    kind, dims, data = decayfmt.decay_file("notes.tdcy5")
+    print(data[16:].decode("utf-8", errors="replace"))
+
+# Or decay bytes in memory, no files involved:
+data = b"the quick brown fox jumps over the lazy dog"
+for _ in range(8):
+    data = decayfmt.corrupt_bytes(data, 1.0, "text")
+```
+
+The binding exposes `corrupt_bytes` (copy out), `corrupt_in_place` (zero-copy on a
+`bytearray`), `encode_file`, `encode_bytes`, `decay_file` (open without display),
+`parse_filename`, `read_header`, and `write_header`. The GIL is released while
+corruption runs, and large payloads are corrupted in parallel across cores. Full
+documentation is on [PyPI](https://pypi.org/project/decayfmt-py/) and in
+[`python/README.md`](python/README.md).
+
+## Performance
+
+Corruption was rewritten around bulk random draws and a parallel region split
+(each region seeds its own OS-entropy generator), and encoding no longer builds a
+second full-size buffer. Measured on an Apple silicon Mac (10 logical cores),
+64 MiB payload, release build, `cargo bench --bench corrupt` / `--bench encode`:
+
+| Scenario | Before | After | Speedup |
+| :--- | ---: | ---: | ---: |
+| text corruption, x=1 | 142 MiB/s | 1,366 MiB/s | 9.6x |
+| text corruption, x=10 | 86 MiB/s | 754 MiB/s | 8.8x |
+| image corruption, x=1 | 187 MiB/s | 1,421 MiB/s | 7.6x |
+| image corruption, x=10 | 116 MiB/s | 950 MiB/s | 8.2x |
+| encode 16 MiB image | 33.2 ms | 32.3 ms | ~1x |
+| encode 16 MiB text | 7.9 ms | 3.9 ms | 2.0x |
+
+The corruption loop itself is now bounded by entropy generation and memory
+bandwidth rather than per-byte RNG calls. End-to-end encode is dominated by image
+decoding and disk I/O, which the rewrite does not touch, so those numbers move
+little. The same distribution holds: per-byte probabilities are quantized to
+1/65536 granularity, about 1.5e-5 absolute error, far below anything a filename
+`x` can distinguish, and the statistical test suite verifies it.
 
 ## How the corruption works
 

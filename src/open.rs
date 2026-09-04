@@ -44,7 +44,10 @@ fn ensure_writable(path: &Path) -> Result<(), DecayError> {
 /// contract: parse x, verify writability, corrupt the payload, write it back. It
 /// performs no display, so the corruption it commits never depends on anything
 /// being shown. The header is read but never changed; only the payload is corrupted.
-fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
+///
+/// Public so embedding callers (such as the Python bindings) can commit an open
+/// without the display side of `open_file`.
+pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     let (filename_type, x) = parse_filename(path)?;
     ensure_writable(path)?;
 
