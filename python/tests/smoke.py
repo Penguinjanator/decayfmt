@@ -66,7 +66,13 @@ def main():
     decayfmt.corrupt_in_place(img, 10.0, "image")
     for i in range(3, len(img), 4):
         assert img[i] == 0xAB, f"alpha modified at index {i}"
-    assert img[0] != 0x00 or img[1] != 0x00 or img[2] != 0x00
+    # Checking a single pixel would fail by chance: at x=10 each channel survives
+    # about 37% of the time, so all three surviving is a roughly 5% flake. Count
+    # across the whole payload instead, where the expected share is far from zero.
+    changed = sum(
+        1 for i in range(len(img)) if i % 4 != 3 and img[i] != 0x00
+    )
+    assert changed > len(img) // 4, f"only {changed} rgb bytes were corrupted"
     print("PASS image alpha channel preserved")
 
     # --- filename parsing ----------------------------------------------------
