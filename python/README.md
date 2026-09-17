@@ -2,7 +2,7 @@
 
 A file format where decay is a first-class property: **every open permanently corrupts the file.**
 
-This is the Python binding for the [decayfmt](https://github.com/aravpanwar/decayfmt) format. Install it with `pip install decayfmt-py`; the module you import is `decayfmt`. Encode a clean file once, then let it decay one open at a time. Each open replaces a random slice of the payload with noise and writes the damage back to disk — irreversibly. There is no undo, no cache, and no way to view the file without paying for it. The header is immutable; only the payload decays.
+This is the Python binding for the [decayfmt](https://github.com/aravpanwar/decayfmt) format. Install it with `pip install decayfmt-py`; the module you import is `decayfmt`. Encode a clean file once, then let it decay one open at a time. Each open replaces a random slice of the payload with noise and writes it back to disk. A corrupted file cannot be restored from its own contents. The header is immutable; only the payload decays.
 
 The binding wraps the same Rust library the CLI uses, so behavior, statistics, and errors are identical.
 
@@ -39,7 +39,7 @@ buf = bytearray(b"some text that will decay")
 decayfmt.corrupt_in_place(buf, 10.0, "text")
 ```
 
-Corruption probability per eligible byte is `p = 1 - exp(-x / 10)`: x = 1 corrupts roughly 9.5% per open, x = 10 roughly 63%. Image corruption touches only the R, G, and B channels — transparency (alpha) is never damaged. Text corruption replaces bytes with printable ASCII and may break UTF-8 sequences, which is the point.
+Corruption probability per eligible byte is `p = 1 - exp(-x / 10)`: x = 1 corrupts roughly 9.5% per open, x = 10 roughly 63%. Image corruption touches only the R, G, and B channels, so transparency (alpha) is never damaged. Text corruption replaces bytes with printable ASCII, so at high x it can break UTF-8 sequences.
 
 ## API
 
@@ -61,17 +61,17 @@ Corruption probability per eligible byte is `p = 1 - exp(-x / 10)`: x = 1 corrup
 
 Failures raise built-in exceptions with the exact message the CLI would print:
 
-- `OSError` — filesystem read/write failures (includes the OS error string).
-- `PermissionError` — the target file is read-only; opening must cost a corruption, so it is refused.
-- `ValueError` — everything else: wrong magic bytes, unknown version, bad filename convention, invalid UTF-8 at encode, undecodable image, and so on.
+- `OSError` for filesystem read/write failures (includes the OS error string).
+- `PermissionError` for a read-only target, where the corrupted payload cannot be written back.
+- `ValueError` for everything else: wrong magic bytes, unknown version, bad filename convention, invalid UTF-8 at encode, undecodable image, and so on.
 
 ## Threading
 
-The GIL is released while corruption, encoding, and file operations run, and large payloads (≥ 1 MiB) are corrupted in parallel across cores. Corruption is always drawn from OS-entropy-seeded generators — never deterministic, never replayable.
+The GIL is released while corruption, encoding, and file operations run, and large payloads (≥ 1 MiB) are corrupted in parallel across cores. Corruption is drawn from generators seeded by operating system entropy, so the corruption sequence cannot be replayed.
 
 ## Image formats
 
-`encode_file` / `encode_bytes` accept whatever the underlying Rust image library decodes: PNG, JPEG, GIF, WebP, TIFF, QOI, BMP, DDS, EXR, HDR, ICO, PNM, TGA, and farbfeld. Images are stored as raw RGBA, so any format you can decode becomes a decaying image.
+`encode_file` / `encode_bytes` accept whatever the underlying Rust image library decodes: PNG, JPEG, GIF, WebP, TIFF, QOI, BMP, DDS, EXR, HDR, ICO, PNM, TGA, and farbfeld. Images are stored as raw RGBA, so any format the library can decode becomes a decaying image.
 
 ## License
 

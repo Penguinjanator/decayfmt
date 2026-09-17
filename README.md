@@ -11,10 +11,11 @@ permanently damages the file on disk, with the amount determined by the filename
 
 ![The same image, encoded at four instability values and opened in step, decaying at four speeds at once](assets/decay-grid.gif)
 
-Two file types:
+Three file types:
 
 - `.idcy<x>` for images (example: `photo.idcy3`)
 - `.tdcy<x>` for text (example: `note.tdcy7`)
+- `.adcy<x>` for audio (example: `clip.adcy5`)
 
 `x` is a positive integer in the filename, the instability parameter. Higher `x` means
 more corruption per open.
@@ -140,36 +141,40 @@ and PowerShell 7 are fine with the line above.
 
 ### Encode
 
-Turn a source image or text file into a decayfmt file. Encoding does not modify the source
-file and applies no corruption.
+Turn a source image, text, or audio file into a decayfmt file. Encoding does not modify the
+source file and applies no corruption.
 
 ```
 decayfmt encode --input photo.png --output photo.idcy3
 decayfmt encode --input note.txt  --output note.tdcy7
+decayfmt encode --input song.mp3  --output song.adcy5
 ```
 
-Both the file type and the instability `x` come from the output name: `idcy` for images and
-`tdcy` for text, followed by `x` as a positive integer (`photo.idcy3` is an image at `x=3`).
+Both the file type and the instability `x` come from the output name: `idcy` for images,
+`tdcy` for text, and `adcy` for audio, followed by `x` as a positive integer
+(`photo.idcy3` is an image at `x=3`).
 Invalid output names are rejected before the file is written. Images are decoded to raw
-RGBA; text must be valid UTF-8.
+RGBA; text must be valid UTF-8; audio (WAV, FLAC, MP3, OGG) is decoded to raw 16-bit PCM,
+so an encoded audio file is much larger than a compressed source.
 
 ### Open
 
 Open a decayfmt file. This corrupts it in place on disk, then displays the result.
 Images open in your system's default image viewer. Text prints to the terminal, and
 when there is no terminal (for example when launched from a file manager) it also
-opens in your default text editor.
+opens in your default text editor. Audio plays in your default audio player.
 
 ```
 decayfmt open photo.idcy3
 decayfmt open note.tdcy7
+decayfmt open clip.adcy5
 ```
 
 `x` is read from the filename, so renaming the file changes how hard the next open hits.
 
 ## Python
 
-The same library is available from Python as the `decayfmt` package — same format,
+The same library is available from Python as the `decayfmt` package, with the same format,
 same statistics, same errors as the CLI:
 
 ```
@@ -244,11 +249,20 @@ state look different and the corruption sequence cannot be replayed.
   Corruption substitutes bytes in place and never inserts or deletes, so the file length
   and the positions of untouched bytes are preserved. At low `x` word lengths and layout
   largely survive. Spaces are replaced at the same rate as any other byte.
+- **Audio:** each 16-bit sample is displaced, with probability `p`, by a random amount
+  bounded by `x`. A sample is one value across two bytes, not two independent bytes, so
+  replacing its bytes outright would throw it across the full range and a single such
+  sample is heard as a click however gentle `x` is. Displacing it instead makes `x` mean
+  roughly what it means for text and images: `x=1` is a faint grain that deepens over
+  many opens, `x=10` buries the clip in noise on the first. Length is preserved, so the
+  clip keeps its duration, sample rate, and channel count however far it rots.
 
 ## Guarantees
 
 - Corruption is written to disk at open time, before display. A crash or kill after the
   write does not undo it.
+- Opens of the same file are serialised with an advisory lock, so concurrent opens each
+  cost their own corruption.
 - Read-only files are rejected with an error, because open must modify the payload before
   displaying it.
 - The header is never changed after encoding. Only the payload decays.
@@ -259,12 +273,11 @@ state look different and the corruption sequence cannot be replayed.
 ## Limitations
 
 - A backup defeats the decay entirely, and a hex editor can tamper with the file.
-- Displaying a file writes the corrupted result to a temporary file for the system viewer.
-  The most recent one persists until the next open sweeps it, or indefinitely if there is
-  no next open, so a snapshot of the last-shown state stays recoverable until then.
-- Two opens running at the same time can race: both read the same starting state, and the
-  last write wins, so concurrent opens may cost fewer corruptions than sequential ones.
-- v1 supports images and text only. No audio, video, or other binary formats.
+- Displaying a file writes the corrupted result to a temporary file for the system
+  viewer, which needs it to outlive the command. Every decayfmt run sweeps the ones left
+  behind earlier, so the most recent display survives until the next run, or indefinitely
+  if there is no next run.
+- Images, text, and audio only. No video or other binary formats.
 
 ## License
 

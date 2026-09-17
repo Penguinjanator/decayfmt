@@ -12,7 +12,7 @@ The wheel build + publish is fully automated; a release is a version bump and a 
    - Environment name: `pypi`
 3. Create a GitHub environment named `pypi` (repo → Settings → Environments)
    so the publish job's `environment: pypi` gate is satisfied. No secrets are
-   needed — publishing uses OpenID Connect.
+   needed, publishing uses OpenID Connect.
 
 ## Releasing a new version
 
@@ -21,16 +21,17 @@ The wheel build + publish is fully automated; a release is a version bump and a 
 2. Tag and push:
 
    ```bash
-   git tag py-v0.1.0
-   git push origin py-v0.1.0
+   git tag py-v0.2.0
+   git push origin py-v0.2.0
    ```
 
 3. The `python` workflow builds and smoke-tests wheels on five platforms
    (manylinux x86_64 + aarch64, macOS arm64 + x86_64, Windows msvc), then the
    `publish` job uploads them to PyPI.
 
-   PyPI tags are deliberately separate from CLI release tags (`v*`), so
-   Python versions and CLI versions can ship independently.
+   A `v*` tag publishes the wheels too, alongside the CLI release and the
+   crates.io publish, so a normal release needs only that one tag. Use `py-v*`
+   when the bindings need a release of their own.
 
 4. Verify:
 

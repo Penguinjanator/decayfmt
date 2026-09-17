@@ -15,32 +15,31 @@ const EXPECTED_MAGIC: &[u8; 4] = b"DCYF";
 
 /// The complete set of failures decayfmt can produce.
 ///
-/// The full contract of how decayfmt fails lives in one place: every error any
-/// module returns is a variant here, each naming the component, operation, and
-/// condition that failed.
+/// Every error any module returns is a variant here, each naming the component,
+/// operation, and condition that failed.
 #[derive(Debug)]
 pub enum DecayError {
     /// The file did not start with the magic bytes DCYF. The file is not a
     /// decayfmt file and must not be parsed any further.
     WrongMagic { found: [u8; 4] },
 
-    /// The version byte is not a version this build understands. We never guess
-    /// at forward compatibility; an unknown version is a hard refusal.
+    /// The version byte is not a version this build understands. An unknown version
+    /// is refused; no forward compatibility is attempted.
     UnsupportedVersion { found: u8 },
 
-    /// The file_type byte is neither image (0x01) nor text (0x02).
+    /// The file_type byte is not image (0x01), text (0x02), or audio (0x03).
     UnsupportedFileType { found: u8 },
 
     /// The filename's extension prefix and the header disagree about the payload
-    /// type, for example an image file renamed to a `.tdcy<x>` name. We refuse
-    /// rather than trust one source over the other.
+    /// type, for example an image file renamed to a `.tdcy<x>` name. The type cannot
+    /// be determined, so the open is refused.
     MismatchedFileType {
         extension_kind: &'static str,
         header_kind: &'static str,
     },
 
     /// The target file is read-only. Corruption cannot be written, so the file is
-    /// not displayed. Opening must cost a corruption; a free read breaks the contract.
+    /// not displayed.
     ReadOnly { path: String },
 
     /// The buffer is shorter than the fixed 16-byte header, so no valid header
@@ -58,7 +57,7 @@ pub enum DecayError {
     XNotPositive { value: f64 },
 
     /// The instability value x in the filename was a run of digits too large to fit
-    /// a u32. There is an x; it is simply out of the supported range.
+    /// a u32.
     XOutOfRange { value: String },
 
     /// A filesystem read or write failed. The context names the component and the
@@ -73,8 +72,17 @@ pub enum DecayError {
     /// error type stays free of any image-crate dependency.
     ImageDecode { context: String },
 
-    /// The output filename for encode had an extension that is neither an image
-    /// (idcy) nor a text (tdcy) decayfmt extension, so the file type is unknown.
+    /// The source given to encode could not be decoded as a supported audio file.
+    /// The context carries the underlying decoder message, kept as a string so this
+    /// error type stays free of any audio-crate dependency.
+    AudioDecode { context: String },
+
+    /// On open, the corrupted audio could not be re-encoded for playback. The context
+    /// carries the underlying encoder message as a string.
+    AudioEncode { context: String },
+
+    /// The output filename for encode had an extension that is not an image (idcy),
+    /// text (tdcy), or audio (adcy) decayfmt extension, so the file type is unknown.
     UnrecognizedExtension { extension: String },
 
     /// On open, the image payload length did not match the width and height in the
@@ -102,7 +110,7 @@ impl fmt::Display for DecayError {
             ),
             DecayError::UnsupportedFileType { found } => write!(
                 f,
-                "format: file_type check failed: 0x{:02x} is neither image (0x01) nor text (0x02).",
+                "format: file_type check failed: 0x{:02x} is not image (0x01), text (0x02), or audio (0x03).",
                 found
             ),
             DecayError::MismatchedFileType {
@@ -145,9 +153,11 @@ impl fmt::Display for DecayError {
             ),
             DecayError::Io { context, source } => write!(f, "{}: {}", context, source),
             DecayError::ImageDecode { context } => write!(f, "{}", context),
+            DecayError::AudioDecode { context } => write!(f, "{}", context),
+            DecayError::AudioEncode { context } => write!(f, "{}", context),
             DecayError::UnrecognizedExtension { extension } => write!(
                 f,
-                "encode: output extension '{}' is neither an image (idcy) nor a text (tdcy) decayfmt extension.",
+                "encode: output extension '{}' is not an image (idcy), text (tdcy), or audio (adcy) decayfmt extension.",
                 extension
             ),
             DecayError::PayloadSizeMismatch { expected, found } => write!(

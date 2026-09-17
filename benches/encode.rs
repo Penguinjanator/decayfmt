@@ -77,7 +77,7 @@ fn main() {
         .collect();
     std::fs::write(&text_input, &text).expect("write bench source text");
 
-    println!("encode benchmark — end to end (read + decode + build + write)");
+    println!("encode benchmark: end to end (read + decode + build + write)");
     bench("image", &image_input, &image_output, image_raw_bytes);
     bench("text", &text_input, &text_output, text.len());
 

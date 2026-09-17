@@ -18,7 +18,7 @@ const MIN_SCENARIO_SECS: f64 = 1.5;
 
 /// Fills `bytes` with a cheap deterministic pattern (xorshift64). Deterministic
 /// so runs are comparable; not cryptographically strong, which is fine because
-/// it never feeds the corruption RNG — `corrupt` seeds its own from OS entropy.
+/// it never feeds the corruption RNG; `corrupt` seeds its own from OS entropy.
 fn fill_pattern(bytes: &mut [u8]) {
     let mut state = 0x243F_6A88_85A3_08D3u64;
     for chunk in bytes.chunks_mut(8) {
@@ -75,7 +75,7 @@ fn main() {
     let mut payload = vec![0u8; payload_len];
     fill_pattern(&mut payload);
     println!(
-        "corruption loop benchmark — payload {} MiB ({} bytes), scenarios until >= {:.1} s each",
+        "corruption loop benchmark: payload {} MiB ({} bytes), scenarios until >= {:.1} s each",
         payload_mb, payload_len, MIN_SCENARIO_SECS
     );
     println!("cores reported by rayon: {}", rayon::current_num_threads());

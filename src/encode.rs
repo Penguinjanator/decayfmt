@@ -1,13 +1,13 @@
 //! Encode a source file into a decayfmt file.
 //!
-//! This module reads a source image or text file, builds the fixed header via
+//! This module reads a source image, text, or audio file, builds the fixed header via
 //! format.rs, and writes the header followed by the raw, uncorrupted payload. The
 //! invariant it upholds is that encoding never corrupts: a freshly encoded file is
 //! clean. Corruption only ever happens at open time, in open.rs. All file I/O for
 //! the encode flow lives here.
 
 use crate::error::DecayError;
-use crate::format::{FileType, Header};
+use crate::format::{FileType, Header, AUDIO_BITS_PER_SAMPLE};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +26,120 @@ pub fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
     Ok((width, height, rgba.into_raw()))
+}
+
+/// Decodes a source audio file into its playback parameters and a raw PCM payload.
+///
+/// symphonia probes the container (WAV, FLAC, MP3, OGG) and decodes the first audio
+/// track to interleaved signed 16-bit little-endian samples, which is what the decayfmt
+/// payload stores. This mirrors how images are reduced to raw RGBA: the container is
+/// stripped so corruption operates on samples rather than on compressed frames, where
+/// damaging a single byte would break the codec instead of degrading the sound.
+///
+/// The sample rate and channel count are returned alongside so the header can record
+/// them; the payload is sample data only and does not describe itself.
+pub fn decode_audio(source_bytes: &[u8], input: &Path) -> Result<(u32, u8, Vec<u8>), DecayError> {
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let decode_error = |message: String| DecayError::AudioDecode {
+        context: format!("encode: decode audio '{}': {}", input.display(), message),
+    };
+
+    // symphonia reads from a seekable stream; the source is already in memory.
+    let stream = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(source_bytes.to_vec())),
+        Default::default(),
+    );
+
+    // The extension is a hint only. If it is wrong or absent, symphonia still probes
+    // the container by its magic bytes.
+    let mut hint = Hint::new();
+    if let Some(extension) = input.extension().and_then(|raw| raw.to_str()) {
+        hint.with_extension(extension);
+    }
+
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|error| decode_error(error.to_string()))?;
+
+    let track = format
+        .default_track(symphonia::core::formats::TrackType::Audio)
+        .ok_or_else(|| decode_error("no audio track found".to_string()))?;
+    let track_id = track.id;
+    let codec_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| decode_error("track has no audio parameters".to_string()))?;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
+        .map_err(|error| decode_error(error.to_string()))?;
+
+    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+    let mut channels = codec_params
+        .channels
+        .as_ref()
+        .map(|channels| channels.count())
+        .unwrap_or(0);
+    let mut payload: Vec<u8> = Vec::new();
+    // copy_bytes_to_vec_interleaved_as resizes its destination to exactly the packet it
+    // is given, so each packet is converted into this scratch buffer and then appended.
+    // Writing straight into the payload would overwrite the packets already decoded.
+    let mut packet_bytes: Vec<u8> = Vec::new();
+
+    // Decode every packet of the chosen track, interleaving samples as they arrive.
+    // An unsupported or corrupt packet ends decoding rather than being skipped, so a
+    // truncated clip is never silently encoded as if it were whole.
+    while let Some(packet) = format
+        .next_packet()
+        .map_err(|error| decode_error(error.to_string()))?
+    {
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| decode_error(error.to_string()))?;
+
+        let spec = decoded.spec();
+        if sample_rate == 0 {
+            sample_rate = spec.rate();
+        }
+        if channels == 0 {
+            channels = spec.channels().count();
+        }
+
+        // Append this packet's frames as interleaved signed 16-bit little-endian bytes,
+        // converting from whatever sample format the codec produced.
+        decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut packet_bytes);
+        payload.extend_from_slice(&packet_bytes);
+    }
+
+    if sample_rate == 0 || channels == 0 {
+        return Err(decode_error(
+            "missing sample rate or channel count".to_string(),
+        ));
+    }
+    if payload.is_empty() {
+        return Err(decode_error("no audio samples decoded".to_string()));
+    }
+    let channels = u8::try_from(channels).map_err(|_| {
+        decode_error(format!(
+            "{channels} channels exceeds the 255 the header holds"
+        ))
+    })?;
+
+    Ok((sample_rate, channels, payload))
 }
 
 /// Produces a raw text payload from source bytes, requiring valid UTF-8.
@@ -105,6 +219,13 @@ fn build_and_write(
             (Header::for_image(width, height), payload)
         }
         FileType::Text => (Header::for_text(), text_payload(source_bytes)?),
+        FileType::Audio => {
+            let (sample_rate, channels, payload) = decode_audio(&source_bytes, source_path)?;
+            (
+                Header::for_audio(sample_rate, channels, AUDIO_BITS_PER_SAMPLE),
+                payload,
+            )
+        }
     };
 
     write_decayfmt(output, header, &payload)
@@ -176,7 +297,7 @@ mod tests {
 
         let header = Header::read(&written).expect("encoded header must parse");
         assert_eq!(
-            header.dimensions,
+            header.image_dimensions(),
             Some(ImageDimensions { width, height }),
             "header must record the source image dimensions"
         );

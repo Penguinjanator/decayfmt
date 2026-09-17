@@ -1,6 +1,6 @@
 [package]
 name = "decayfmt"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A file format where decay is a first-class property. Every open permanently corrupts the file."
 license = "MIT"
@@ -12,12 +12,17 @@ exclude = ["assets/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+hound = "3.5"
 image = { version = "0.25", default-features = false, features = [
     "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm",
     "qoi", "tga", "tiff", "webp",
 ] }
 rand = "0.8"
 rayon = "1"
+symphonia = { version = "0.6", default-features = false, features = [
+    "wav", "flac", "mp3", "ogg", "vorbis", "pcm",
+] }
 
 [profile.release]
 strip = true

@@ -1,15 +1,15 @@
 //! Python bindings for decayfmt, the file format where decay is a first-class
 //! property: every open permanently corrupts the file.
 //!
-//! This module wraps the Rust library crate directly — the same corruption,
-//! encode, and header routines the CLI uses — and exposes them as plain
+//! This module wraps the Rust library crate directly, the same corruption,
+//! encode, and header routines the CLI uses, and exposes them as plain
 //! functions. Errors map to built-in Python exceptions: filesystem failures
 //! raise `OSError`, a read-only target raises `PermissionError`, and every
 //! other refusal (bad magic, bad filename, invalid UTF-8, ...) raises
 //! `ValueError`, each carrying the exact message the CLI would print.
 
 use decayfmt_core::error::DecayError;
-use decayfmt_core::format::{FileType, Header};
+use decayfmt_core::format::{FileType, Header, AUDIO_BITS_PER_SAMPLE};
 use pyo3::exceptions::{PyOSError, PyPermissionError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyByteArrayMethods, PyBytes, PyBytesMethods};
@@ -33,8 +33,9 @@ fn file_type_from_str(kind: &str) -> PyResult<FileType> {
     match kind {
         "image" => Ok(FileType::Image),
         "text" => Ok(FileType::Text),
+        "audio" => Ok(FileType::Audio),
         other => Err(PyValueError::new_err(format!(
-            "kind must be \"image\" or \"text\", got {other:?}"
+            "kind must be \"image\", \"text\", or \"audio\", got {other:?}"
         ))),
     }
 }
@@ -87,8 +88,8 @@ fn corrupt_in_place(
 /// Encodes a source file into a decayfmt file, exactly like the CLI `encode`.
 ///
 /// The output name determines the payload type and x: `name.idcy<x>` for
-/// images, `name.tdcy<x>` for text. The produced file is clean; corruption
-/// only ever happens at open time.
+/// images, `name.tdcy<x>` for text, `name.adcy<x>` for audio. The produced file
+/// is clean; corruption happens at open time.
 #[pyfunction]
 fn encode_file(py: Python<'_>, source_path: &str, output_path: &str) -> PyResult<()> {
     let source = Path::new(source_path);
@@ -100,7 +101,8 @@ fn encode_file(py: Python<'_>, source_path: &str, output_path: &str) -> PyResult
 /// Encodes in-memory bytes into a decayfmt file.
 ///
 /// The bytes are treated as a source file: decoded to raw RGBA for image
-/// output names and validated as UTF-8 for text names. Useful for sources
+/// output names, validated as UTF-8 for text names, and decoded to raw PCM for
+/// audio names. Useful for sources
 /// that are already in memory (e.g. an image from PIL), or when `encode_file`
 /// would require a temporary file.
 #[pyfunction]
@@ -113,11 +115,10 @@ fn encode_bytes(py: Python<'_>, source: &Bound<'_, PyBytes>, output_path: &str) 
 
 /// Opens a decayfmt file: permanently corrupts it on disk, no display.
 ///
-/// This is the CLI's open minus the display step — the file on disk is
-/// corrupted and persisted, and the result is returned to Python. **There is
-/// no recovery: the previous payload state is gone.** Returns the file type
-/// label, the image dimensions (or `None` for text), and the full new file
-/// bytes including the untouched header.
+/// This is the CLI's open minus the display step: the corrupted payload is
+/// written back to the file before returning. Returns the file type label, the
+/// image dimensions (`None` for text and audio), and the full new file bytes
+/// including the untouched header.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn decay_file(py: Python<'_>, path: &str) -> PyResult<(String, Option<(u32, u32)>, Py<PyBytes>)> {
@@ -126,7 +127,7 @@ fn decay_file(py: Python<'_>, path: &str) -> PyResult<(String, Option<(u32, u32)
         .detach(|| decayfmt_core::open::decay_in_place(path))
         .map_err(map_err)?;
     let kind = header.file_type.label().to_string();
-    let dimensions = header.dimensions.map(|d| (d.width, d.height));
+    let dimensions = header.image_dimensions().map(|d| (d.width, d.height));
     let bytes = PyBytes::new(py, &file_bytes).into();
     Ok((kind, dimensions, bytes))
 }
@@ -143,27 +144,30 @@ fn parse_filename(name: &str) -> PyResult<(String, f64)> {
 }
 
 /// Reads the 16-byte decayfmt header from `data` and returns its type label
-/// and image dimensions (`None` for text).
+/// and image dimensions (`None` for text and audio).
 #[pyfunction]
 fn read_header(data: &Bound<'_, PyBytes>) -> PyResult<(String, Option<(u32, u32)>)> {
     let header = Header::read(data.as_bytes()).map_err(map_err)?;
     Ok((
         header.file_type.label().to_string(),
-        header.dimensions.map(|d| (d.width, d.height)),
+        header.image_dimensions().map(|d| (d.width, d.height)),
     ))
 }
 
 /// Builds a 16-byte decayfmt header.
 ///
-/// `kind="image"` requires both `width` and `height`; `kind="text"` ignores
-/// them. Useful together with `encode_bytes`-style workflows that write their
-/// own files.
+/// `kind="image"` requires both `width` and `height`; `kind="audio"` requires
+/// `sample_rate` and `channels`; `kind="text"` ignores them all. Useful together
+/// with `encode_bytes`-style workflows that write their own files.
 #[pyfunction]
+#[pyo3(signature = (kind, width=None, height=None, sample_rate=None, channels=None))]
 fn write_header(
     py: Python<'_>,
     kind: &str,
     width: Option<u32>,
     height: Option<u32>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
 ) -> PyResult<Py<PyBytes>> {
     let file_type = file_type_from_str(kind)?;
     let header = match file_type {
@@ -176,6 +180,16 @@ fn write_header(
             }
         },
         FileType::Text => Header::for_text(),
+        FileType::Audio => match (sample_rate, channels) {
+            (Some(sample_rate), Some(channels)) => {
+                Header::for_audio(sample_rate, channels, AUDIO_BITS_PER_SAMPLE)
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "audio headers require both sample_rate and channels",
+                ));
+            }
+        },
     };
     Ok(PyBytes::new(py, &header.write()).into())
 }
