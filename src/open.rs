@@ -4,7 +4,9 @@
 //! operations is fixed and must not be reordered: x is parsed from the filename, the
 //! file is confirmed writable, the payload is corrupted, the corrupted bytes are
 //! written back to disk, and only then is the result displayed. Corruption is written
-//! before display, so a crash mid-flow cannot produce an uncorrupted read.
+//! before display, so a crash mid-flow cannot produce an uncorrupted read. The whole
+//! read-modify-write sequence runs under an exclusive advisory lock on the file, so
+//! overlapping opens each cost their own corruption instead of overwriting each other.
 
 use crate::corrupt::corrupt;
 use crate::error::DecayError;
@@ -12,8 +14,9 @@ use crate::format::{
     parse_filename, AudioSpec, Header, ImageDimensions, Metadata, AUDIO_BITS_PER_SAMPLE,
     AUDIO_BYTES_PER_SAMPLE, HEADER_SIZE,
 };
+use fs2::FileExt;
 use std::fs::OpenOptions;
-use std::io::{IsTerminal, Seek, SeekFrom, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,10 +55,31 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     let (filename_type, x) = parse_filename(path)?;
     ensure_writable(path)?;
 
-    let mut file_bytes = std::fs::read(path).map_err(|error| DecayError::Io {
-        context: format!("open: read '{}'", path.display()),
+    // One handle serves the whole read, corrupt, and write-back sequence, held under an
+    // exclusive advisory lock. Reading and writing through separate handles would leave
+    // a window where two concurrent opens both read the same starting payload and the
+    // later write discarded the earlier one, so the two opens together cost a single
+    // corruption. The kernel releases the lock when the file is dropped or the process
+    // exits, so a crash cannot leave it held.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| DecayError::Io {
+            context: format!("open: open '{}'", path.display()),
+            source: error,
+        })?;
+    file.lock_exclusive().map_err(|error| DecayError::Io {
+        context: format!("open: lock '{}' for a single open", path.display()),
         source: error,
     })?;
+
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes)
+        .map_err(|error| DecayError::Io {
+            context: format!("open: read '{}'", path.display()),
+            source: error,
+        })?;
 
     let header = Header::read(&file_bytes)?;
 
@@ -73,18 +97,12 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     // and is left untouched; everything after it is the payload.
     corrupt(&mut file_bytes[HEADER_SIZE..], header.file_type, x);
 
-    // Persist the corruption by overwriting only the payload region in place. The
-    // header bytes on disk are never rewritten, and because corruption preserves length
-    // the file is never truncated. The previous payload bytes are not kept anywhere. A
-    // crash mid-write leaves a partially corrupted payload behind an intact header, so
-    // the file still decays rather than bricking.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|error| DecayError::Io {
-            context: format!("open: reopen for write '{}'", path.display()),
-            source: error,
-        })?;
+    // Persist the corruption by overwriting only the payload region in place, through
+    // the same locked handle the payload was read from. The header bytes on disk are
+    // never rewritten, and because corruption preserves length the file is never
+    // truncated. The previous payload bytes are not kept anywhere. A crash mid-write
+    // leaves a partially corrupted payload behind an intact header, so the file still
+    // decays rather than bricking.
     file.seek(SeekFrom::Start(HEADER_SIZE as u64))
         .map_err(|error| DecayError::Io {
             context: format!("open: seek past header in '{}'", path.display()),
@@ -412,6 +430,57 @@ mod tests {
             encoded.len() - HEADER_SIZE,
             1_000 * 2 * AUDIO_BYTES_PER_SAMPLE,
             "payload must be exactly the decoded PCM, every frame of it"
+        );
+
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&decay_file);
+    }
+
+    #[test]
+    fn concurrent_opens_each_cost_a_corruption() {
+        // Opening always costs a corruption, including when opens overlap. Corruption
+        // only ever replaces bytes, so from an all-'a' payload the count of surviving
+        // 'a' bytes falls with every open that lands. Without the exclusive lock two
+        // opens could read the same starting payload and the later write would discard
+        // the earlier one, leaving more survivors on disk than N sequential opens.
+        use std::sync::Barrier;
+
+        const THREADS: usize = 4;
+        const PAYLOAD: usize = 4 * 1024 * 1024;
+
+        let input = unique_temp_path("source.txt");
+        let decay_file = unique_temp_path("note.tdcy10");
+        fs::write(&input, vec![b'a'; PAYLOAD]).expect("write test source");
+        encode_file(&input, &decay_file).expect("encode should succeed");
+
+        let barrier = Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let path = decay_file.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    // Release every thread at once so the read-modify-write windows
+                    // genuinely overlap.
+                    barrier.wait();
+                    decay_in_place(&path).expect("decay should succeed");
+                });
+            }
+        });
+
+        let on_disk = fs::read(&decay_file).expect("read opened file");
+        let survivors = on_disk[HEADER_SIZE..]
+            .iter()
+            .filter(|&&b| b == b'a')
+            .count();
+
+        // At x=10 each open replaces about 63% of bytes, so after THREADS opens the
+        // expected survival is 0.37^THREADS, about 1.9% here. Even one lost open would
+        // leave roughly 0.37^(THREADS-1), about 5%, so this bound separates them
+        // comfortably while staying far from the fully sequential expectation.
+        let survival = survivors as f64 / (PAYLOAD as f64);
+        assert!(
+            survival < 0.035,
+            "{survivors} of {PAYLOAD} bytes survived ({survival:.4});              an open was lost to a concurrent write"
         );
 
         let _ = fs::remove_file(&input);

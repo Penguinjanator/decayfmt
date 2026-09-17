@@ -258,6 +258,8 @@ state look different and the corruption sequence cannot be replayed.
 
 - Corruption is written to disk at open time, before display. A crash or kill after the
   write does not undo it.
+- Opens of the same file are serialised with an advisory lock, so concurrent opens each
+  cost their own corruption.
 - Read-only files are rejected with an error, because open must modify the payload before
   displaying it.
 - The header is never changed after encoding. Only the payload decays.
@@ -271,8 +273,6 @@ state look different and the corruption sequence cannot be replayed.
 - Displaying a file writes the corrupted result to a temporary file for the system viewer.
   The most recent one persists until the next open sweeps it, or indefinitely if there is
   no next open, so a snapshot of the last-shown state stays recoverable until then.
-- Two opens running at the same time can race: both read the same starting state, and the
-  last write wins, so concurrent opens may cost fewer corruptions than sequential ones.
 - Images, text, and audio only. No video or other binary formats.
 
 ## License

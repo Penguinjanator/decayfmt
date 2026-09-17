@@ -12,6 +12,7 @@ exclude = ["assets/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
 hound = "3.5"
 image = { version = "0.25", default-features = false, features = [
     "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm",
