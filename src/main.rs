@@ -47,6 +47,13 @@ enum Command {
 /// typed decayfmt error and exits with a failure code; on success, exits cleanly.
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Sweep the temporary files left by the last display before doing anything else.
+    // Running this for every command, rather than only inside open, means an encode or
+    // a failed open also clears the snapshot of a past decay state that the previous
+    // display left in the temp directory.
+    decayfmt::open::cleanup_old_view_files();
+
     let result = match cli.command {
         Command::Encode { input, output } => decayfmt::encode::encode_file(&input, &output),
         Command::Open { file } => decayfmt::open::open_file(&file),

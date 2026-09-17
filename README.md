@@ -270,9 +270,10 @@ state look different and the corruption sequence cannot be replayed.
 ## Limitations
 
 - A backup defeats the decay entirely, and a hex editor can tamper with the file.
-- Displaying a file writes the corrupted result to a temporary file for the system viewer.
-  The most recent one persists until the next open sweeps it, or indefinitely if there is
-  no next open, so a snapshot of the last-shown state stays recoverable until then.
+- Displaying a file writes the corrupted result to a temporary file for the system
+  viewer, which needs it to outlive the command. Every decayfmt run sweeps the ones left
+  behind earlier, so the most recent display survives until the next run, or indefinitely
+  if there is no next run.
 - Images, text, and audio only. No video or other binary formats.
 
 ## License

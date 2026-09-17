@@ -281,10 +281,13 @@ fn temporary_output_path(extension: &str) -> PathBuf {
 ///
 /// Displaying a corrupted payload requires writing it to a temporary file for the
 /// system viewer, and those files persist as copies of earlier, less-corrupted payload
-/// states. Each open sweeps the previous ones so those copies do not accumulate.
-/// Failures are ignored: a file still held open by a viewer simply survives until the
-/// next run.
-fn cleanup_old_view_files() {
+/// states. Every command sweeps them, not just a successful open, so an encode or a
+/// failed open also clears whatever the last display left behind. Failures are ignored:
+/// a file still held open by a viewer simply survives until the next run.
+///
+/// The file from the current open cannot be swept here, because the viewer is launched
+/// asynchronously and needs it to outlive this process.
+pub fn cleanup_old_view_files() {
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
@@ -434,6 +437,29 @@ mod tests {
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&decay_file);
+    }
+
+    #[test]
+    fn sweeping_removes_stale_view_files() {
+        // A display file from a previous open is a copy of a less corrupted state, so
+        // the sweep must remove it. The current open's own file cannot be swept, since
+        // the viewer is launched asynchronously and needs it to outlive the process.
+        let stale = std::env::temp_dir().join(format!(
+            "decayfmt_view_{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        fs::write(&stale, b"a less corrupted state").expect("write stale view file");
+        assert!(stale.exists(), "the stale file must exist before the sweep");
+
+        cleanup_old_view_files();
+
+        assert!(
+            !stale.exists(),
+            "the sweep must remove view files left by earlier opens"
+        );
     }
 
     #[test]
