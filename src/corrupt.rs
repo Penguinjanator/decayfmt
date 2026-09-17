@@ -35,6 +35,13 @@ const RGBA_BYTES_PER_PIXEL: usize = 4;
 /// Index of the alpha channel within an RGBA pixel. This byte is never corrupted.
 const ALPHA_INDEX: usize = 3;
 
+/// Largest displacement applied to an audio sample at the most destructive x, as an
+/// absolute sample value. Full scale, so as x rises the injected noise grows loud enough
+/// to bury the payload rather than merely sitting alongside it. Raising it makes every
+/// audio x harsher; lowering it makes audio decay gentler without touching text or
+/// images.
+const AUDIO_MAX_NOISE: u16 = 32_767;
+
 /// Lowest printable ASCII byte used as a text corruption replacement (space).
 const PRINTABLE_ASCII_LOW: u8 = 0x20;
 
@@ -182,26 +189,52 @@ fn corrupt_image_chunk(chunk: &mut [u8], threshold: u16, pool: &[u16]) {
     }
 }
 
-/// Corrupts an audio payload chunk by replacing bytes, each independently with
-/// probability threshold / 65536, with a uniformly random byte.
+/// Corrupts a 16-bit audio payload chunk by displacing whole samples, each with
+/// probability threshold / 65536, by a bounded random amount.
 ///
-/// Every byte of every sample is eligible, including the high byte that carries most
-/// of a sample's amplitude. Corrupting it swings the sample across the full range, so
-/// decay is heard as clicks and pops that grow into broadband noise rather than as a
-/// gentle hiss.
+/// A sample is one value split across two bytes, not two independent bytes, so this
+/// operates on the sample rather than on its bytes. Replacing the bytes outright would
+/// throw the sample anywhere in the full range, and a single such sample is heard as a
+/// full-scale click regardless of how gentle x is; replacing only the low byte caps the
+/// total possible damage at about 0.8% of full scale, which is inaudible at any x. Both
+/// make x mean something different for audio than it does for text and images.
+///
+/// Instead a selected sample is displaced by a random offset whose magnitude is bounded
+/// by [`audio_noise_amplitude`], which scales with x. Low x is a light graininess, high
+/// x swamps the signal, and the result saturates rather than wrapping, so decay never
+/// flips a loud sample to the opposite extreme.
 ///
 /// Substitution preserves length, so the clip keeps its duration, channel count, and
-/// sample rate however far it decays. The low byte of a fresh u16 draw is the
-/// replacement, uniform over 0..=255.
+/// sample rate however far it decays.
 fn corrupt_audio_chunk(chunk: &mut [u8], threshold: u16, pool: &[u16]) {
+    let amplitude = audio_noise_amplitude(threshold);
     let mut draw = 0;
-    for byte in chunk.iter_mut() {
+    for sample in chunk.chunks_exact_mut(AUDIO_BYTES_PER_SAMPLE) {
         if pool[draw] < threshold {
             draw += 1;
-            *byte = pool[draw] as u8;
+            // Map the draw onto a signed offset in [-amplitude, amplitude], then
+            // saturate so a displaced sample clamps at the ends of the range instead
+            // of wrapping around to the opposite sign.
+            let span = amplitude.saturating_mul(2).saturating_add(1) as u32;
+            let offset = (pool[draw] as u32 % span) as i32 - amplitude as i32;
+            let old = i16::from_le_bytes([sample[0], sample[1]]) as i32;
+            let new = (old + offset).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            sample.copy_from_slice(&new.to_le_bytes());
         }
         draw += 1;
     }
+}
+
+/// The maximum distance a corrupted audio sample may move from its original value.
+///
+/// Derived from the same threshold that sets how many samples are selected, so a single
+/// x controls both how often decay lands and how hard it hits: at low x few samples move
+/// and only slightly, at high x most samples move a long way. The two factors compound,
+/// so the injected noise sits far below the payload at x = 1 and rises above it by
+/// x = 10, which is the same span text and images cover.
+fn audio_noise_amplitude(threshold: u16) -> u16 {
+    let fraction = f64::from(threshold) / f64::from(u16::MAX);
+    (fraction * f64::from(AUDIO_MAX_NOISE)) as u16
 }
 
 /// Corrupts a text payload chunk by replacing bytes, each independently with
@@ -285,18 +318,63 @@ mod tests {
     }
 
     #[test]
-    fn audio_corruption_fraction_at_x10_is_near_expected() {
-        // Audio replacements are uniform over all 256 byte values, so a selected byte
-        // keeps its original value 1 in 256 times. The observable changed fraction is
-        // therefore p * 255/256, not p.
+    fn audio_displaces_about_the_expected_share_of_samples() {
+        // Audio displaces whole samples rather than replacing bytes, so the measurement
+        // is over samples. A displaced sample can land back on its original value, which
+        // is rare enough at this amplitude to sit inside the tolerance.
         let original = vec![0u8; 100_000];
         let mut payload = original.clone();
         corrupt(&mut payload, FileType::Audio, 10.0);
-        let expected = 0.632 * 255.0 / 256.0;
-        let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
+
+        let changed = original
+            .chunks_exact(AUDIO_BYTES_PER_SAMPLE)
+            .zip(payload.chunks_exact(AUDIO_BYTES_PER_SAMPLE))
+            .filter(|(before, after)| before != after)
+            .count();
+        let total = original.len() / AUDIO_BYTES_PER_SAMPLE;
+        let fraction = changed as f64 / total as f64;
         assert!(
-            (fraction - expected).abs() < FRACTION_TOLERANCE,
-            "x=10 audio fraction {fraction} not within {FRACTION_TOLERANCE} of {expected}",
+            (fraction - 0.632).abs() < FRACTION_TOLERANCE,
+            "x=10 displaced {fraction} of samples, expected near 0.632",
+        );
+    }
+
+    #[test]
+    fn audio_displacement_is_bounded_and_scales_with_x() {
+        // No sample may move further than the amplitude x allows, and a higher x must
+        // move samples further. This is what keeps a single open from turning a quiet
+        // sample into a full-scale click, which is how x stays comparable to the other
+        // payload types.
+        fn mean_shift(x: f64) -> f64 {
+            // A mid-scale sample everywhere, so displacement in either direction is
+            // measurable without saturating at the ends of the range.
+            let original: Vec<u8> = (0..50_000).flat_map(|_| 8_000i16.to_le_bytes()).collect();
+            let mut payload = original.clone();
+            corrupt(&mut payload, FileType::Audio, x);
+
+            let shifts: Vec<i32> = original
+                .chunks_exact(AUDIO_BYTES_PER_SAMPLE)
+                .zip(payload.chunks_exact(AUDIO_BYTES_PER_SAMPLE))
+                .map(|(before, after)| {
+                    let before = i16::from_le_bytes([before[0], before[1]]) as i32;
+                    let after = i16::from_le_bytes([after[0], after[1]]) as i32;
+                    (after - before).abs()
+                })
+                .collect();
+
+            let bound = i32::from(audio_noise_amplitude(probability_threshold(x)));
+            assert!(
+                shifts.iter().all(|shift| *shift <= bound),
+                "a sample moved further than the amplitude x allows"
+            );
+            shifts.iter().sum::<i32>() as f64 / shifts.len() as f64
+        }
+
+        let gentle = mean_shift(1.0);
+        let severe = mean_shift(10.0);
+        assert!(
+            severe > gentle * 4.0,
+            "x=10 mean shift {severe} was not well above x=1 mean shift {gentle}"
         );
     }
 

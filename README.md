@@ -249,9 +249,12 @@ state look different and the corruption sequence cannot be replayed.
   Corruption substitutes bytes in place and never inserts or deletes, so the file length
   and the positions of untouched bytes are preserved. At low `x` word lengths and layout
   largely survive. Spaces are replaced at the same rate as any other byte.
-- **Audio:** every byte of every 16-bit sample is replaced with probability `p` by a
-  random byte, including the high byte that carries most of the amplitude. Decay is
-  heard as clicks and pops that grow into broadband noise. Length is preserved, so the
+- **Audio:** each 16-bit sample is displaced, with probability `p`, by a random amount
+  bounded by `x`. A sample is one value across two bytes, not two independent bytes, so
+  replacing its bytes outright would throw it across the full range and a single such
+  sample is heard as a click however gentle `x` is. Displacing it instead makes `x` mean
+  roughly what it means for text and images: `x=1` is a faint grain that deepens over
+  many opens, `x=10` buries the clip in noise on the first. Length is preserved, so the
   clip keeps its duration, sample rate, and channel count however far it rots.
 
 ## Guarantees
