@@ -7,9 +7,7 @@
 _Featured in [This Week in Rust #660](https://this-week-in-rust.org/blog/2026/07/15/this-week-in-rust-660/)._
 
 **A file format that corrupts itself a little every time you open it.** Every open
-permanently damages the file on disk, by an amount baked into the filename, before it is
-ever shown to you. There is no recovery from the file alone. The file is the only copy
-that matters, and every read destroys a little more of it.
+permanently damages the file on disk, with the amount determined by the filename.
 
 ![The same image, encoded at four instability values and opened in step, decaying at four speeds at once](assets/decay-grid.gif)
 
@@ -24,9 +22,8 @@ more corruption per open.
 ## Watch it decay
 
 The grid above is one image encoded at `x=1`, `x=3`, `x=8`, and `x=15`, each opened the
-same number of times. Same picture, four rates of decay. To follow a single instability
-value across individual opens instead, each open corrupting the file further on disk
-before it is ever shown, with no way back:
+same number of times. Same picture, four rates of decay. The examples below follow single
+files across successive opens.
 
 The clean original:
 
@@ -53,15 +50,14 @@ original : This sentence is dying, and every time you read it you kill it a litt
  open 12 : h/Sm hgf}Nk0-'ts?K|iqgd HD6 e@`~V}t&Fe y%u re&" )2 Pnu kiKB )6UaC1it1lYMm1]b!
 ```
 
-Corruption only ever swaps in printable characters, so the text rots into readable-looking
-nonsense.
+Corruption only replaces bytes with printable characters, so the result degrades into
+text-like noise.
 
-## What this is, and is not
+## Scope
 
-decayfmt is a social contract, not a security tool. Do not treat it as encryption, DRM, or
-a way to securely wipe a file. The corruption is honest and unrecoverable from the file
-alone, but anyone with a backup or a hex editor can defeat it. If you want the original,
-keep a backup. If you do not want anyone to recover it, do not make one.
+A corrupted file cannot be restored from its own contents. A copy made beforehand is
+untouched, so keep a backup if you want the original. decayfmt makes no cryptographic
+guarantee and is not a way to securely wipe a file.
 
 ## FAQ
 
@@ -69,34 +65,26 @@ A video sent a lot of people here at once, so here are the questions I keep gett
 
 **Does the file corrupt itself?**
 
-No. Files are just data and cannot change on their own. decayfmt's `open` command is what
-corrupts the file: it reads the bytes, damages some of them, writes them back, and then shows
-you the result. A different program opening the same file would leave it untouched. The
-"self-corrupting" line is shorthand for "the tool corrupts it every time you use the tool to
-look at it."
+The `open` command does it. It reads the bytes, damages some of them, writes them back, and
+then shows you the result. Another program opening the same file leaves it untouched.
 
 **Is this DRM? Could a company use it to make you re-buy games?**
 
-No, and it would be a terrible way to try. Anyone can copy the file before opening it and keep
-the original forever, so a backup defeats the whole thing in one step. It also needs write
-access to work, and a game that damaged its own files on every launch would break itself
-almost immediately. If a company wanted your files gone, they would just delete them. This
-gives nobody a power they did not already have.
+No. A copy made before opening is unaffected, so the format cannot enforce one-time access to
+the original. It also needs write access to the file it opens.
 
 **Is it dangerous? Is it malware?**
 
-No. It only touches files you deliberately encode into the decayfmt format and then open with
-decayfmt. It does not scan your disk or run on its own. It is a toy, not a weapon.
+It only touches files you encode into the decayfmt format and then open with decayfmt. It does
+not scan your disk or run on its own.
 
 **Can I get a decayed file back?**
 
-Not from the file itself. Once the corruption is written, the earlier version is gone. If you
-want the original, keep a backup. That is the entire point.
+Not from the file itself. Recovery requires a copy of an earlier version.
 
 **Why does it exist?**
 
 Mostly for fun. I liked the idea of a file you could use up, like a print left in the sun.
-There is no serious use case, and I have been upfront about that from the start.
 
 ## Install
 
@@ -137,10 +125,9 @@ decayfmt encode --input note.txt --output note.tdcy8
 decayfmt open note.tdcy8
 ```
 
-The instability `x` comes from the output name (`note.tdcy8` decays at `x=8`). Run that last
-line a few more times and watch the sentence rot further on each open. The corruption is
-written to disk before it prints, so there is no way back. A high `x` like 8 garbles it
-fast; a low `x` like 1 is a slow burn over many opens.
+The instability `x` comes from the output name (`note.tdcy8` decays at `x=8`). Run
+`decayfmt open note.tdcy8` a few more times to watch the sentence rot further on each open.
+A high `x` like 8 garbles it fast; a low `x` like 1 is a slow burn over many opens.
 
 On Windows PowerShell the `>` redirect writes UTF-16, which decayfmt refuses; create the
 file with `Set-Content note.txt "this sentence is about to start dying"` instead. cmd.exe
@@ -150,8 +137,8 @@ and PowerShell 7 are fine with the line above.
 
 ### Encode
 
-Turn a source image or text file into a decayfmt file. Encoding never corrupts; the new
-file is clean.
+Turn a source image or text file into a decayfmt file. Encoding does not modify the source
+file and applies no corruption.
 
 ```
 decayfmt encode --input photo.png --output photo.idcy3
@@ -160,8 +147,8 @@ decayfmt encode --input note.txt  --output note.tdcy7
 
 Both the file type and the instability `x` come from the output name: `idcy` for images and
 `tdcy` for text, followed by `x` as a positive integer (`photo.idcy3` is an image at `x=3`).
-An output name that could never be opened is refused rather than written. Images are decoded
-to raw RGBA; text must be valid UTF-8.
+Invalid output names are rejected before the file is written. Images are decoded to raw
+RGBA; text must be valid UTF-8.
 
 ### Open
 
@@ -252,17 +239,15 @@ state look different and the corruption sequence cannot be replayed.
   byte. This operates on bytes, not characters, so at high `x` it can break UTF-8; the
   viewer renders what it can and substitutes the replacement character for the rest.
   Corruption substitutes bytes in place and never inserts or deletes, so the file length
-  and the positions of untouched bytes are preserved: content decays but structure does
-  not. The original byte length is always recoverable, and at low `x` word lengths and
-  layout largely survive. Spaces are not protected; they are replaced at the same rate as
-  any other byte and erode along with everything else as `x` rises.
+  and the positions of untouched bytes are preserved. At low `x` word lengths and layout
+  largely survive. Spaces are replaced at the same rate as any other byte.
 
-## The contract
+## Guarantees
 
 - Corruption is written to disk at open time, before display. A crash or kill after the
-  write does not undo it. Opening always costs a corruption.
-- A read-only file is refused with an error and never displayed. A free read would break
-  the contract.
+  write does not undo it.
+- Read-only files are rejected with an error, because open must modify the payload before
+  displaying it.
 - The header is never changed after encoding. Only the payload decays.
 - There is no state in the file: no read counter, no timestamp, no record of who opened
   it or when.
@@ -270,9 +255,7 @@ state look different and the corruption sequence cannot be replayed.
 
 ## Limitations
 
-- This is a social contract, not cryptography. A backup defeats it entirely.
-- A determined person with a hex editor can tamper with the file.
-- It is not a secure deletion tool and makes no cryptographic guarantee.
+- A backup defeats the decay entirely, and a hex editor can tamper with the file.
 - Displaying a file writes the corrupted result to a temporary file for the system viewer.
   The most recent one persists until the next open sweeps it, or indefinitely if there is
   no next open, so a snapshot of the last-shown state stays recoverable until then.
