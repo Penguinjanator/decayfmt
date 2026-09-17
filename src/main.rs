@@ -25,17 +25,18 @@ struct Cli {
 /// The subcommands decayfmt exposes.
 #[derive(Subcommand)]
 enum Command {
-    /// Encode a source image or text file into a decayfmt file.
+    /// Encode a source image, text, or audio file into a decayfmt file.
     Encode {
-        /// Path to the source image or text file to encode.
+        /// Path to the source image, text, or audio file to encode.
         #[arg(long)]
         input: PathBuf,
-        /// Path to write the decayfmt file to, ending in .idcy<x> or .tdcy<x>. The
-        /// instability value x is taken from this name; higher x decays faster.
+        /// Path to write the decayfmt file to, ending in .idcy<x>, .tdcy<x>, or
+        /// .adcy<x>. The instability value x is taken from this name; higher x
+        /// decays faster.
         #[arg(long)]
         output: PathBuf,
     },
-    /// Open a decayfmt file: corrupt it in place on disk, then display it.
+    /// Open a decayfmt file: corrupt it in place on disk, then display or play it.
     Open {
         /// Path to the decayfmt file to open. x is read from its extension.
         file: PathBuf,

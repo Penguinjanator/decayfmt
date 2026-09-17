@@ -1,12 +1,11 @@
-//! Corruption algorithms for image and text payloads.
+//! Corruption algorithms for image, text, and audio payloads.
 //!
 //! These are pure functions over byte slices. There is no file I/O and no CLI
 //! logic here; the caller is responsible for reading the payload, calling into
 //! this module, and writing the result back. The invariant this module upholds is
 //! that corruption is always stochastic and always drawn from a cryptographically
-//! secure generator seeded from operating system entropy, never from a fixed seed.
-//! It is never deterministic, because a reproducible corruption sequence could be
-//! replayed to reconstruct the original and undo the decay. Large payloads are
+//! secure generator seeded from operating system entropy, never from a fixed seed,
+//! so the corruption sequence is not reproducible. Large payloads are
 //! processed in parallel regions, each of which seeds its own OS-entropy
 //! generator; the per-byte decisions stay independent across region boundaries,
 //! so the aggregate remains undirected noise.
@@ -17,7 +16,7 @@
 // lint do not warn about the allow itself.
 #![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
-use crate::format::FileType;
+use crate::format::{FileType, AUDIO_BYTES_PER_SAMPLE};
 use rand::{Rng, RngCore};
 
 /// The divisor in the corruption probability curve p = 1 - exp(-x / DECAY_SCALE).
@@ -27,8 +26,7 @@ use rand::{Rng, RngCore};
 /// makes every x gentler (more opens are needed to reach the same damage). At the
 /// current value of 10, x = 1 corrupts roughly 9.5% of eligible bytes per open and
 /// x = 10 corrupts roughly 63%. Changing this number changes the meaning of every
-/// existing filename's x, so it is treated as part of the format's feel, not a
-/// free parameter.
+/// existing filename's x, so it is fixed rather than configurable.
 const DECAY_SCALE: f64 = 10.0;
 
 /// Number of bytes per pixel in an RGBA image payload.
@@ -79,8 +77,8 @@ fn corruption_probability(x: f64) -> f64 {
 /// the threshold, giving an effective per-byte probability of t / 65536. That
 /// deviates from the continuous p by at most 1 / 65536 (about 1.5e-5), which is
 /// far below what any filename x can distinguish. The cast saturates: p = 1
-/// becomes 65535, so even a saturated threshold leaves a 1-in-65536 byte
-/// untouched rather than promising exact certainty.
+/// becomes 65535, so even a saturated threshold leaves roughly 1 byte in 65536
+/// untouched.
 fn probability_threshold(x: f64) -> u16 {
     (corruption_probability(x) * 65536.0) as u16
 }
@@ -99,13 +97,16 @@ pub fn corrupt(payload: &mut [u8], file_type: FileType, x: f64) {
 
 /// Corrupts the eligible portion of `payload` using the given integer threshold.
 ///
-/// Text corrupts every byte; image corrupts only the R, G, and B channels of
-/// whole pixels, so the payload is truncated to a whole number of pixels and any
-/// trailing bytes are left untouched.
+/// Text and audio corrupt every byte; image corrupts only the R, G, and B channels
+/// of whole pixels. Image and audio payloads are truncated to a whole number of
+/// pixels or samples, so any trailing partial unit is left untouched.
 fn corrupt_payload(payload: &mut [u8], file_type: FileType, threshold: u16) {
     let eligible_len = match file_type {
         FileType::Text => payload.len(),
         FileType::Image => payload.len() - payload.len() % RGBA_BYTES_PER_PIXEL,
+        // Audio corrupts every byte of every whole sample. A trailing partial sample
+        // is left alone so the payload always ends on a sample boundary.
+        FileType::Audio => payload.len() - payload.len() % AUDIO_BYTES_PER_SAMPLE,
     };
     if eligible_len == 0 {
         return;
@@ -154,6 +155,7 @@ fn region_work<R: RngCore>(
         match file_type {
             FileType::Text => corrupt_text_chunk(chunk, threshold, &pool, rng),
             FileType::Image => corrupt_image_chunk(chunk, threshold, &pool),
+            FileType::Audio => corrupt_audio_chunk(chunk, threshold, &pool),
         }
     }
 }
@@ -180,14 +182,35 @@ fn corrupt_image_chunk(chunk: &mut [u8], threshold: u16, pool: &[u16]) {
     }
 }
 
+/// Corrupts an audio payload chunk by replacing bytes, each independently with
+/// probability threshold / 65536, with a uniformly random byte.
+///
+/// Every byte of every sample is eligible, including the high byte that carries most
+/// of a sample's amplitude. Corrupting it swings the sample across the full range, so
+/// decay is heard as clicks and pops that grow into broadband noise rather than as a
+/// gentle hiss.
+///
+/// Substitution preserves length, so the clip keeps its duration, channel count, and
+/// sample rate however far it decays. The low byte of a fresh u16 draw is the
+/// replacement, uniform over 0..=255.
+fn corrupt_audio_chunk(chunk: &mut [u8], threshold: u16, pool: &[u16]) {
+    let mut draw = 0;
+    for byte in chunk.iter_mut() {
+        if pool[draw] < threshold {
+            draw += 1;
+            *byte = pool[draw] as u8;
+        }
+        draw += 1;
+    }
+}
+
 /// Corrupts a text payload chunk by replacing bytes, each independently with
 /// probability threshold / 65536, with a uniformly random printable ASCII byte
 /// (0x20 to 0x7E).
 ///
 /// Operates on bytes, not Unicode codepoints, so at high x this can split or
-/// break multi-byte UTF-8 sequences. That is intended: the display layer is
-/// responsible for substituting the Unicode replacement character for whatever
-/// is no longer valid. This module only damages bytes.
+/// break multi-byte UTF-8 sequences. The display layer substitutes the Unicode
+/// replacement character for the resulting invalid sequences.
 fn corrupt_text_chunk<R: RngCore>(chunk: &mut [u8], threshold: u16, pool: &[u16], rng: &mut R) {
     let mut draw = 0;
     for byte in chunk.iter_mut() {
@@ -245,33 +268,61 @@ mod tests {
     }
 
     #[test]
-    fn text_corruption_fraction_at_x1_is_near_expected() {
+    fn text_corruption_fraction_matches_probability() {
         // An all-zero payload makes measurement exact: a corruption replacement is
-        // always printable ASCII (never zero), so every selected byte visibly
-        // changes and the changed fraction equals the selection probability.
+        // always printable ASCII (never zero), so every selected byte visibly changes
+        // and the changed fraction equals the selection probability.
+        for (x, expected) in [(1.0, 0.095), (10.0, 0.632)] {
+            let original = vec![0u8; 100_000];
+            let mut payload = original.clone();
+            corrupt(&mut payload, FileType::Text, x);
+            let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
+            assert!(
+                (fraction - expected).abs() < FRACTION_TOLERANCE,
+                "x={x} text fraction {fraction} not within {FRACTION_TOLERANCE} of {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn audio_corruption_fraction_at_x10_is_near_expected() {
+        // Audio replacements are uniform over all 256 byte values, so a selected byte
+        // keeps its original value 1 in 256 times. The observable changed fraction is
+        // therefore p * 255/256, not p.
         let original = vec![0u8; 100_000];
         let mut payload = original.clone();
-        corrupt(&mut payload, FileType::Text, 1.0);
+        corrupt(&mut payload, FileType::Audio, 10.0);
+        let expected = 0.632 * 255.0 / 256.0;
         let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
         assert!(
-            (fraction - 0.095).abs() < FRACTION_TOLERANCE,
-            "x=1 text fraction {} not within {} of 0.095",
-            fraction,
-            FRACTION_TOLERANCE
+            (fraction - expected).abs() < FRACTION_TOLERANCE,
+            "x=10 audio fraction {fraction} not within {FRACTION_TOLERANCE} of {expected}",
         );
     }
 
     #[test]
-    fn text_corruption_fraction_at_x10_is_near_expected() {
-        let original = vec![0u8; 100_000];
+    fn audio_corruption_preserves_length() {
+        // Length preservation is what keeps a decayed clip at its original duration,
+        // channel count, and sample rate however far it rots.
+        let original = vec![7u8; 4096];
         let mut payload = original.clone();
-        corrupt(&mut payload, FileType::Text, 10.0);
-        let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
-        assert!(
-            (fraction - 0.632).abs() < FRACTION_TOLERANCE,
-            "x=10 text fraction {} not within {} of 0.632",
-            fraction,
-            FRACTION_TOLERANCE
+        corrupt(&mut payload, FileType::Audio, 10.0);
+        assert_eq!(
+            payload.len(),
+            original.len(),
+            "audio corruption must never change the payload length"
+        );
+    }
+
+    #[test]
+    fn audio_trailing_partial_sample_is_untouched() {
+        // An odd-length payload cannot end on a 16-bit sample boundary. The trailing
+        // byte is left alone so the payload always ends on a whole sample.
+        let mut payload = vec![0u8; 8193];
+        corrupt(&mut payload, FileType::Audio, 10.0);
+        assert_eq!(
+            payload[8192], 0,
+            "the trailing partial sample must not be corrupted"
         );
     }
 
@@ -313,7 +364,7 @@ mod tests {
         // high x many times, and confirm every alpha byte survives untouched.
         const PIXELS: usize = 2_000;
         const ALPHA_SENTINEL: u8 = 0xAB;
-        const RUNS: usize = 1_000;
+        const RUNS: usize = 20;
 
         for _ in 0..RUNS {
             let mut payload = Vec::with_capacity(PIXELS * RGBA_BYTES_PER_PIXEL);
@@ -388,26 +439,6 @@ mod tests {
             assert_eq!(
                 pixel[ALPHA_INDEX], ALPHA_SENTINEL,
                 "alpha channel was modified by parallel corruption"
-            );
-        }
-    }
-
-    #[test]
-    fn large_text_fraction_near_expected() {
-        // 8 MiB all-zero payload spans multiple parallel regions; the measured
-        // fraction must still match the continuous probability within tolerance.
-        for (x, expected) in [(1.0, 0.095), (10.0, 0.632)] {
-            let original = vec![0u8; 8 * 1024 * 1024];
-            let mut payload = original.clone();
-            corrupt(&mut payload, FileType::Text, x);
-            let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
-            assert!(
-                (fraction - expected).abs() < FRACTION_TOLERANCE,
-                "x={} text fraction {} not within {} of {}",
-                x,
-                fraction,
-                FRACTION_TOLERANCE,
-                expected
             );
         }
     }

@@ -1,8 +1,9 @@
 //! The decayfmt format definition: the binary header and the filename convention.
 //!
 //! This module owns two pieces of format metadata: the fixed 16-byte header (magic,
-//! version, file type, and image dimensions) and the filename convention that carries
-//! the payload type and the instability value x (`name.idcy<x>` / `name.tdcy<x>`). It
+//! version, file type, and a per-type metadata region) and the filename convention that
+//! carries the payload type and the instability value x (`name.idcy<x>` /
+//! `name.tdcy<x>` / `name.adcy<x>`). It
 //! knows nothing about corruption, file I/O, or the CLI. The header is written exactly
 //! once at encode time and never mutated afterward; only the payload that follows it
 //! ever changes. The invariant this module upholds is that a buffer is only accepted
@@ -17,7 +18,11 @@ pub const MAGIC: [u8; 4] = *b"DCYF";
 
 /// The format version this build reads and writes. An unknown version is refused,
 /// never interpreted, because the meaning of later versions is not knowable here.
-pub const VERSION: u8 = 0x01;
+///
+/// Version 0x02 added the audio payload type. Files written by earlier builds carry
+/// version 0x01 and are refused rather than reinterpreted: the metadata region is laid
+/// out per payload type and the v1 layout differs.
+pub const VERSION: u8 = 0x02;
 
 /// file_type byte for an image payload (raw RGBA pixels).
 pub const FILE_TYPE_IMAGE: u8 = 0x01;
@@ -25,11 +30,26 @@ pub const FILE_TYPE_IMAGE: u8 = 0x01;
 /// file_type byte for a text payload (raw UTF-8 bytes).
 pub const FILE_TYPE_TEXT: u8 = 0x02;
 
+/// file_type byte for an audio payload (raw interleaved PCM samples).
+pub const FILE_TYPE_AUDIO: u8 = 0x03;
+
 /// Filename extension prefix that precedes x for an image, for example `idcy3`.
 pub const IMAGE_EXTENSION_PREFIX: &str = "idcy";
 
 /// Filename extension prefix that precedes x for text, for example `tdcy7`.
 pub const TEXT_EXTENSION_PREFIX: &str = "tdcy";
+
+/// Filename extension prefix that precedes x for audio, for example `adcy5`.
+pub const AUDIO_EXTENSION_PREFIX: &str = "adcy";
+
+/// Bits per sample of an audio payload. Sources are decoded to signed 16-bit
+/// little-endian PCM regardless of their original depth, so every audio payload this
+/// build writes carries this value. It is stored in the header rather than assumed so
+/// a reader can reject a payload it would otherwise misinterpret.
+pub const AUDIO_BITS_PER_SAMPLE: u8 = 16;
+
+/// Bytes per audio sample, derived from [`AUDIO_BITS_PER_SAMPLE`].
+pub const AUDIO_BYTES_PER_SAMPLE: usize = (AUDIO_BITS_PER_SAMPLE as usize) / 8;
 
 /// Byte offset of the 4-byte little-endian image width within the header.
 const WIDTH_OFFSET: usize = 6;
@@ -37,14 +57,28 @@ const WIDTH_OFFSET: usize = 6;
 /// Byte offset of the 4-byte little-endian image height within the header.
 const HEIGHT_OFFSET: usize = 10;
 
+/// Byte offset of the 4-byte little-endian audio sample rate in hertz.
+const SAMPLE_RATE_OFFSET: usize = 6;
+
+/// Byte offset of the 1-byte audio channel count.
+const CHANNELS_OFFSET: usize = 10;
+
+/// Byte offset of the 1-byte audio bits-per-sample value.
+const BITS_PER_SAMPLE_OFFSET: usize = 11;
+
 /// Byte offset of the reserved region within the header.
 const RESERVED_OFFSET: usize = 14;
 
-/// Number of reserved bytes after the dimensions. Zero-filled on write, ignored on read.
+/// Number of reserved bytes after the per-type metadata. Zero-filled on write,
+/// ignored on read.
 const RESERVED_LEN: usize = 2;
 
 /// Total size of the fixed header: 4 (magic) + 1 (version) + 1 (file_type)
-/// + 4 (width) + 4 (height) + 2 (reserved).
+/// + 8 (per-type metadata) + 2 (reserved).
+///
+/// Bytes 6..14 are a per-type metadata region, interpreted according to the file_type
+/// byte that precedes it: image stores width and height, audio stores sample rate,
+/// channel count, and bits per sample, and text leaves the whole region zero.
 pub const HEADER_SIZE: usize = RESERVED_OFFSET + RESERVED_LEN;
 
 /// Which kind of payload follows the header.
@@ -52,6 +86,7 @@ pub const HEADER_SIZE: usize = RESERVED_OFFSET + RESERVED_LEN;
 pub enum FileType {
     Image,
     Text,
+    Audio,
 }
 
 impl FileType {
@@ -60,6 +95,7 @@ impl FileType {
         match self {
             FileType::Image => FILE_TYPE_IMAGE,
             FileType::Text => FILE_TYPE_TEXT,
+            FileType::Audio => FILE_TYPE_AUDIO,
         }
     }
 
@@ -69,6 +105,7 @@ impl FileType {
         match byte {
             FILE_TYPE_IMAGE => Ok(FileType::Image),
             FILE_TYPE_TEXT => Ok(FileType::Text),
+            FILE_TYPE_AUDIO => Ok(FileType::Audio),
             other => Err(DecayError::UnsupportedFileType { found: other }),
         }
     }
@@ -79,13 +116,15 @@ impl FileType {
         match self {
             FileType::Image => "image",
             FileType::Text => "text",
+            FileType::Audio => "audio",
         }
     }
 }
 
 /// Parses the decayfmt filename convention into the payload type and instability x.
 ///
-/// The convention is `name.idcy<x>` for images and `name.tdcy<x>` for text, where x
+/// The convention is `name.idcy<x>` for images, `name.tdcy<x>` for text, and
+/// `name.adcy<x>` for audio, where x
 /// is a positive integer. The payload type comes from the prefix and x from the
 /// integer suffix. Both encode (to validate its output name) and open (to read x and
 /// cross-check the type against the header) go through here, so the naming rule lives
@@ -99,6 +138,8 @@ pub fn parse_filename(path: &Path) -> Result<(FileType, f64), DecayError> {
         (FileType::Image, rest)
     } else if let Some(rest) = extension.strip_prefix(TEXT_EXTENSION_PREFIX) {
         (FileType::Text, rest)
+    } else if let Some(rest) = extension.strip_prefix(AUDIO_EXTENSION_PREFIX) {
+        (FileType::Audio, rest)
     } else {
         return Err(DecayError::UnrecognizedExtension {
             extension: extension.to_string(),
@@ -128,15 +169,37 @@ pub struct ImageDimensions {
     pub height: u32,
 }
 
-/// The parsed, validated header of a decayfmt file. It carries the payload type and,
-/// for images, the pixel dimensions needed to interpret the raw RGBA payload. Magic
-/// and version are validated on read and not stored, because they are fixed for a
-/// given build.
+/// The playback parameters of an audio payload. Stored in the header so the flat
+/// interleaved PCM payload can be turned back into a playable clip when the file is
+/// opened. The payload is always signed 16-bit little-endian PCM, so `bits_per_sample`
+/// records the format rather than selecting between several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSpec {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bits_per_sample: u8,
+}
+
+/// The per-type metadata carried in header bytes 6..14.
+///
+/// The region is interpreted according to the file_type byte that precedes it, so each
+/// payload type names exactly the fields it needs and text carries none, so the
+/// file_type byte fully determines the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metadata {
+    Image(ImageDimensions),
+    Text,
+    Audio(AudioSpec),
+}
+
+/// The parsed, validated header of a decayfmt file. It carries the payload type and
+/// the per-type metadata needed to interpret the raw payload that follows. Magic and
+/// version are validated on read and not stored, because they are fixed for a given
+/// build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub file_type: FileType,
-    /// Present only for images; None for text, which has no dimensions.
-    pub dimensions: Option<ImageDimensions>,
+    pub metadata: Metadata,
 }
 
 /// Reads a little-endian u32 from `buffer` at `offset`. The caller must have already
@@ -155,44 +218,84 @@ impl Header {
     pub fn for_image(width: u32, height: u32) -> Header {
         Header {
             file_type: FileType::Image,
-            dimensions: Some(ImageDimensions { width, height }),
+            metadata: Metadata::Image(ImageDimensions { width, height }),
         }
     }
 
-    /// Builds a header for a text payload, which carries no dimensions.
+    /// Builds a header for a text payload, which carries no metadata.
     pub fn for_text() -> Header {
         Header {
             file_type: FileType::Text,
-            dimensions: None,
+            metadata: Metadata::Text,
+        }
+    }
+
+    /// Builds a header for an audio payload with the given playback parameters.
+    pub fn for_audio(sample_rate: u32, channels: u8, bits_per_sample: u8) -> Header {
+        Header {
+            file_type: FileType::Audio,
+            metadata: Metadata::Audio(AudioSpec {
+                sample_rate,
+                channels,
+                bits_per_sample,
+            }),
+        }
+    }
+
+    /// Returns the image dimensions when this header describes an image.
+    pub fn image_dimensions(&self) -> Option<ImageDimensions> {
+        match self.metadata {
+            Metadata::Image(dimensions) => Some(dimensions),
+            _ => None,
+        }
+    }
+
+    /// Returns the audio spec when this header describes an audio payload.
+    pub fn audio_spec(&self) -> Option<AudioSpec> {
+        match self.metadata {
+            Metadata::Audio(spec) => Some(spec),
+            _ => None,
         }
     }
 
     /// Serializes the header to its fixed 16-byte on-disk form.
     ///
-    /// Upholds the invariant that the reserved bytes are always zero on write. Image
-    /// dimensions are written as two little-endian u32 values; for text those bytes
-    /// stay zero. The header produced here is written once and never rewritten.
+    /// Upholds the invariant that the reserved bytes are always zero on write. The
+    /// per-type metadata region is written according to the payload type: image
+    /// dimensions as two little-endian u32 values, audio as a little-endian u32 sample
+    /// rate followed by two single-byte fields, and text leaves the region zero. The
+    /// header produced here is written once and never rewritten.
     pub fn write(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         bytes[0..4].copy_from_slice(&MAGIC);
         bytes[4] = VERSION;
         bytes[5] = self.file_type.to_byte();
-        if let Some(dimensions) = self.dimensions {
-            bytes[WIDTH_OFFSET..WIDTH_OFFSET + 4].copy_from_slice(&dimensions.width.to_le_bytes());
-            bytes[HEIGHT_OFFSET..HEIGHT_OFFSET + 4]
-                .copy_from_slice(&dimensions.height.to_le_bytes());
+        match self.metadata {
+            Metadata::Image(dimensions) => {
+                bytes[WIDTH_OFFSET..WIDTH_OFFSET + 4]
+                    .copy_from_slice(&dimensions.width.to_le_bytes());
+                bytes[HEIGHT_OFFSET..HEIGHT_OFFSET + 4]
+                    .copy_from_slice(&dimensions.height.to_le_bytes());
+            }
+            Metadata::Audio(spec) => {
+                bytes[SAMPLE_RATE_OFFSET..SAMPLE_RATE_OFFSET + 4]
+                    .copy_from_slice(&spec.sample_rate.to_le_bytes());
+                bytes[CHANNELS_OFFSET] = spec.channels;
+                bytes[BITS_PER_SAMPLE_OFFSET] = spec.bits_per_sample;
+            }
+            // For text the metadata bytes stay zero.
+            Metadata::Text => {}
         }
-        // For text the dimension bytes stay zero, and the reserved bytes at
-        // bytes[RESERVED_OFFSET..] are always left zero.
+        // The reserved bytes at bytes[RESERVED_OFFSET..] are always left zero.
         bytes
     }
 
     /// Parses and validates a header from the start of a buffer.
     ///
     /// Upholds the invariant that a header is only accepted if its magic and version
-    /// match this build exactly. Image dimensions are read from the header; for text
-    /// they are absent. The trailing reserved bytes are ignored. Returns a typed
-    /// error for every way the buffer can fail to be a header this build understands.
+    /// match this build exactly. The per-type metadata region is read according to the
+    /// file type. The trailing reserved bytes are ignored. Returns a typed error for
+    /// every way the buffer can fail to be a header this build understands.
     pub fn read(buffer: &[u8]) -> Result<Header, DecayError> {
         if buffer.len() < HEADER_SIZE {
             return Err(DecayError::PayloadTooSmall {
@@ -213,18 +316,23 @@ impl Header {
         }
 
         let file_type = FileType::from_byte(buffer[5])?;
-        let dimensions = match file_type {
-            FileType::Image => Some(ImageDimensions {
+        let metadata = match file_type {
+            FileType::Image => Metadata::Image(ImageDimensions {
                 width: read_u32_le(buffer, WIDTH_OFFSET),
                 height: read_u32_le(buffer, HEIGHT_OFFSET),
             }),
-            FileType::Text => None,
+            FileType::Text => Metadata::Text,
+            FileType::Audio => Metadata::Audio(AudioSpec {
+                sample_rate: read_u32_le(buffer, SAMPLE_RATE_OFFSET),
+                channels: buffer[CHANNELS_OFFSET],
+                bits_per_sample: buffer[BITS_PER_SAMPLE_OFFSET],
+            }),
         };
 
         // The reserved bytes at buffer[RESERVED_OFFSET..HEADER_SIZE] are ignored.
         Ok(Header {
             file_type,
-            dimensions,
+            metadata,
         })
     }
 }
@@ -239,27 +347,52 @@ mod tests {
     }
 
     #[test]
-    fn image_header_round_trips_with_dimensions() {
-        let original = Header::for_image(640, 480);
-        let bytes = original.write();
-        let parsed = Header::read(&bytes).expect("valid image header must parse");
-        assert_eq!(parsed, original, "image round-trip changed the header");
+    fn headers_round_trip_with_their_own_metadata() {
+        // write -> read is identity for each payload type, and the accessors return
+        // metadata only for the type that carries it. The file_type byte is what
+        // decides how the shared metadata region is read.
+        let image = Header::for_image(640, 480);
+        let text = Header::for_text();
+        let audio = Header::for_audio(44_100, 2, AUDIO_BITS_PER_SAMPLE);
+
+        for original in [image, text, audio] {
+            let parsed = Header::read(&original.write()).expect("valid header must parse");
+            assert_eq!(parsed, original, "round-trip changed the header");
+        }
+
+        let image = Header::read(&image.write()).expect("image header must parse");
         assert_eq!(
-            parsed.dimensions,
+            image.image_dimensions(),
             Some(ImageDimensions {
                 width: 640,
                 height: 480
             })
         );
-    }
+        assert!(
+            image.audio_spec().is_none(),
+            "an image carries no audio spec"
+        );
 
-    #[test]
-    fn text_header_round_trips_without_dimensions() {
-        let original = Header::for_text();
-        let bytes = original.write();
-        let parsed = Header::read(&bytes).expect("valid text header must parse");
-        assert_eq!(parsed, original, "text round-trip changed the header");
-        assert_eq!(parsed.dimensions, None, "text headers carry no dimensions");
+        let text = Header::read(&text.write()).expect("text header must parse");
+        assert!(
+            text.image_dimensions().is_none(),
+            "text carries no dimensions"
+        );
+        assert!(text.audio_spec().is_none(), "text carries no audio spec");
+
+        let audio = Header::read(&audio.write()).expect("audio header must parse");
+        assert_eq!(
+            audio.audio_spec(),
+            Some(AudioSpec {
+                sample_rate: 44_100,
+                channels: 2,
+                bits_per_sample: AUDIO_BITS_PER_SAMPLE,
+            })
+        );
+        assert!(
+            audio.image_dimensions().is_none(),
+            "audio carries no image dimensions"
+        );
     }
 
     #[test]
@@ -291,7 +424,7 @@ mod tests {
     fn magic_and_version_bytes_are_exact() {
         let bytes = Header::for_image(2, 2).write();
         assert_eq!(&bytes[0..4], b"DCYF", "magic bytes must be DCYF");
-        assert_eq!(bytes[4], 0x01, "version byte must be 0x01");
+        assert_eq!(bytes[4], 0x02, "version byte must be 0x02");
         assert_eq!(bytes[5], FILE_TYPE_IMAGE, "file_type byte must be image");
     }
 
@@ -306,13 +439,33 @@ mod tests {
     }
 
     #[test]
-    fn wrong_version_is_refused() {
-        let mut bytes = valid_image_header();
-        bytes[4] = 0x02;
-        match Header::read(&bytes) {
-            Err(DecayError::UnsupportedVersion { found }) => assert_eq!(found, 0x02),
-            other => panic!("expected UnsupportedVersion, got {:?}", other),
+    fn unsupported_versions_are_refused() {
+        // Both a future version and the v1 layout are refused rather than
+        // reinterpreted: v1 laid out the metadata region differently, so a file from
+        // an older build cannot be read with the current layout.
+        for version in [0x01, 0x03] {
+            let mut bytes = valid_image_header();
+            bytes[4] = version;
+            match Header::read(&bytes) {
+                Err(DecayError::UnsupportedVersion { found }) => assert_eq!(found, version),
+                other => panic!("expected UnsupportedVersion for 0x{version:02x}, got {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn audio_sample_rate_is_written_little_endian() {
+        let bytes = Header::for_audio(44_100, 2, AUDIO_BITS_PER_SAMPLE).write();
+        assert_eq!(
+            &bytes[6..10],
+            &44_100u32.to_le_bytes(),
+            "sample rate must be little-endian"
+        );
+        assert_eq!(bytes[10], 2, "channel count must follow the sample rate");
+        assert_eq!(
+            bytes[11], AUDIO_BITS_PER_SAMPLE,
+            "bits per sample must follow the channel count"
+        );
     }
 
     #[test]
@@ -348,7 +501,7 @@ mod tests {
         let parsed = Header::read(&bytes).expect("reserved bytes must be ignored");
         assert_eq!(parsed.file_type, FileType::Image);
         assert_eq!(
-            parsed.dimensions,
+            parsed.image_dimensions(),
             Some(ImageDimensions {
                 width: 640,
                 height: 480
@@ -358,56 +511,49 @@ mod tests {
 
     #[test]
     fn parse_filename_reads_type_and_x() {
-        assert_eq!(
-            parse_filename(Path::new("photo.idcy3")).expect("idcy3 parses"),
-            (FileType::Image, 3.0)
-        );
-        assert_eq!(
-            parse_filename(Path::new("note.tdcy12")).expect("tdcy12 parses"),
-            (FileType::Text, 12.0)
-        );
+        for (name, expected) in [
+            ("photo.idcy3", (FileType::Image, 3.0)),
+            ("note.tdcy12", (FileType::Text, 12.0)),
+            ("clip.adcy5", (FileType::Audio, 5.0)),
+        ] {
+            assert_eq!(
+                parse_filename(Path::new(name)).expect("valid name must parse"),
+                expected,
+                "'{name}' did not parse to its type and x"
+            );
+        }
     }
 
     #[test]
-    fn parse_filename_refuses_unrecognized_extension() {
+    fn parse_filename_refuses_every_malformed_name() {
+        // Each way a name can fail is a distinct error, so a caller can tell an
+        // unknown extension from a missing x from an x out of range.
         for name in ["photo.png", "note.txt", "no_extension"] {
             assert!(
                 matches!(
                     parse_filename(Path::new(name)),
                     Err(DecayError::UnrecognizedExtension { .. })
                 ),
-                "'{}' should be an unrecognized extension",
-                name
+                "'{name}' should be an unrecognized extension"
             );
         }
-    }
 
-    #[test]
-    fn parse_filename_refuses_missing_or_non_numeric_x() {
         for name in ["photo.idcy", "note.tdcyx", "photo.idcy3a"] {
             assert!(
                 matches!(
                     parse_filename(Path::new(name)),
                     Err(DecayError::FilenameNoX { .. })
                 ),
-                "'{}' should yield FilenameNoX",
-                name
+                "'{name}' should yield FilenameNoX"
             );
         }
-    }
 
-    #[test]
-    fn parse_filename_refuses_zero_x() {
         assert!(matches!(
             parse_filename(Path::new("photo.idcy0")),
             Err(DecayError::XNotPositive { .. })
         ));
-    }
 
-    #[test]
-    fn parse_filename_refuses_x_too_large_for_u32() {
-        // A run of digits that overflows u32 reports an out-of-range error, not the
-        // misleading "no x" error, since there clearly is an x, it is just too big.
+        // A run of digits that overflows u32 reports out-of-range, not "no x".
         assert!(matches!(
             parse_filename(Path::new("photo.idcy99999999999")),
             Err(DecayError::XOutOfRange { .. })

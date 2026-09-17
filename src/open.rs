@@ -1,15 +1,17 @@
 //! Open a decayfmt file: corrupt it in place on disk, then display it.
 //!
 //! This module owns the entire open flow and all of its file I/O. The order of
-//! operations is the core of the format contract and must not be reordered: x is
-//! parsed from the filename, the file is confirmed writable, the payload is
-//! corrupted, the corrupted bytes are written back to disk, and only then is the
-//! result displayed. Corruption is paid before display, so a crash mid-flow can
-//! never hand back a free, uncorrupted read.
+//! operations is fixed and must not be reordered: x is parsed from the filename, the
+//! file is confirmed writable, the payload is corrupted, the corrupted bytes are
+//! written back to disk, and only then is the result displayed. Corruption is written
+//! before display, so a crash mid-flow cannot produce an uncorrupted read.
 
 use crate::corrupt::corrupt;
 use crate::error::DecayError;
-use crate::format::{parse_filename, Header, ImageDimensions, HEADER_SIZE};
+use crate::format::{
+    parse_filename, AudioSpec, Header, ImageDimensions, Metadata, AUDIO_BITS_PER_SAMPLE,
+    AUDIO_BYTES_PER_SAMPLE, HEADER_SIZE,
+};
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,9 +23,8 @@ const RGBA_BYTES_PER_PIXEL: usize = 4;
 
 /// Confirms the file can be written before any corruption is attempted.
 ///
-/// The format contract is that opening costs a corruption. If the file is
-/// read-only that corruption cannot be written, so we fail closed here, before
-/// reading or displaying anything, rather than discovering it after a display.
+/// A read-only file cannot receive its corrupted payload, so this check runs before
+/// any read or display and fails closed.
 fn ensure_writable(path: &Path) -> Result<(), DecayError> {
     let metadata = std::fs::metadata(path).map_err(|error| DecayError::Io {
         context: format!("open: stat '{}'", path.display()),
@@ -40,10 +41,10 @@ fn ensure_writable(path: &Path) -> Result<(), DecayError> {
 /// Corrupts a decayfmt file in place on disk and returns its header and the new
 /// file bytes.
 ///
-/// This is the persisted half of the open flow and the part that upholds the
-/// contract: parse x, verify writability, corrupt the payload, write it back. It
-/// performs no display, so the corruption it commits never depends on anything
-/// being shown. The header is read but never changed; only the payload is corrupted.
+/// This is the persisted half of the open flow: parse x, verify writability, corrupt
+/// the payload, write it back. It performs no display, so the corruption it writes is
+/// independent of the display path. The header is read but never changed; only the
+/// payload is corrupted.
 ///
 /// Public so embedding callers (such as the Python bindings) can commit an open
 /// without the display side of `open_file`.
@@ -60,7 +61,7 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
 
     // The extension prefix and the header must agree on the payload type. If they
     // disagree, for example an image file renamed to a .tdcy<x> name, refuse rather
-    // than trust one source over the other.
+    // than trusting either source.
     if filename_type != header.file_type {
         return Err(DecayError::MismatchedFileType {
             extension_kind: filename_type.label(),
@@ -73,11 +74,10 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     corrupt(&mut file_bytes[HEADER_SIZE..], header.file_type, x);
 
     // Persist the corruption by overwriting only the payload region in place. The
-    // header bytes on disk are never rewritten, matching the contract that the header
-    // is immutable after encode, and because corruption preserves length the file is
-    // never truncated. This is the point of no return: once the write lands the
-    // previous payload state is gone. A crash mid-write leaves a partially corrupted
-    // payload behind an intact header, so the file still decays rather than bricking.
+    // header bytes on disk are never rewritten, and because corruption preserves length
+    // the file is never truncated. The previous payload bytes are not kept anywhere. A
+    // crash mid-write leaves a partially corrupted payload behind an intact header, so
+    // the file still decays rather than bricking.
     let mut file = OpenOptions::new()
         .write(true)
         .open(path)
@@ -101,16 +101,17 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
 
 /// Opens a decayfmt file: corrupts its payload in place on disk, then displays it.
 ///
-/// Upholds the contract ordering: the file is corrupted and persisted first, then
-/// displayed. Dimensions are present exactly for images, so their presence selects
-/// the display path.
+/// The file is corrupted and persisted first, then displayed. The header's per-type
+/// metadata selects the display path, so each payload type is presented with the
+/// parameters it recorded at encode time.
 pub fn open_file(path: &Path) -> Result<(), DecayError> {
     cleanup_old_view_files();
     let (header, file_bytes) = decay_in_place(path)?;
     let payload = &file_bytes[HEADER_SIZE..];
-    match header.dimensions {
-        Some(dimensions) => display_image(payload, dimensions),
-        None => display_text(payload),
+    match header.metadata {
+        Metadata::Image(dimensions) => display_image(payload, dimensions),
+        Metadata::Text => display_text(payload),
+        Metadata::Audio(spec) => play_audio(payload, spec),
     }
 }
 
@@ -118,7 +119,7 @@ pub fn open_file(path: &Path) -> Result<(), DecayError> {
 ///
 /// The payload may no longer be valid UTF-8 after corruption, so it is rendered
 /// lossily: invalid byte sequences become the Unicode replacement character rather
-/// than causing a failure. Corruption is allowed to break the text; display is not.
+/// than causing a failure.
 ///
 /// The text is always written to stdout. When stdout is not a terminal, for example
 /// when decayfmt was launched from a file manager, that output goes nowhere, so the
@@ -175,6 +176,77 @@ fn display_image(payload: &[u8], dimensions: ImageDimensions) -> Result<(), Deca
     open_in_default_app(&viewer_path)
 }
 
+/// Re-encodes a corrupted PCM payload to a temporary WAV and opens it in the system's
+/// default audio player.
+///
+/// The raw payload carries no playback parameters of its own, so the header's sample
+/// rate, channel count, and bit depth are required to interpret it. WAV is used for the
+/// same reason PNG is used for images: hound is pure Rust, so the binary stays
+/// self-contained, and an uncompressed container reproduces the decayed samples exactly
+/// rather than running them through a lossy encoder that would add its own artifacts.
+///
+/// A payload whose length is not a whole number of frames is rejected as a size
+/// mismatch rather than played back partially.
+fn play_audio(payload: &[u8], spec: AudioSpec) -> Result<(), DecayError> {
+    if spec.bits_per_sample != AUDIO_BITS_PER_SAMPLE {
+        return Err(DecayError::AudioEncode {
+            context: format!(
+                "open: header declares {} bits per sample but this build only writes and plays {}.",
+                spec.bits_per_sample, AUDIO_BITS_PER_SAMPLE
+            ),
+        });
+    }
+    if spec.channels == 0 {
+        return Err(DecayError::AudioEncode {
+            context: "open: header declares zero audio channels.".to_string(),
+        });
+    }
+
+    // Every frame holds one sample per channel, so the payload must divide evenly into
+    // whole frames for the clip to be complete.
+    let bytes_per_frame = AUDIO_BYTES_PER_SAMPLE * spec.channels as usize;
+    // `manual_is_multiple_of` suggests `usize::is_multiple_of`, which is stable only
+    // from Rust 1.87; the remainder test keeps the minimum supported Rust version low,
+    // matching the same choice made in corrupt.rs.
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+    if payload.len() % bytes_per_frame != 0 {
+        let whole_frames = payload.len() / bytes_per_frame;
+        return Err(DecayError::PayloadSizeMismatch {
+            expected: whole_frames.saturating_add(1) * bytes_per_frame,
+            found: payload.len(),
+        });
+    }
+
+    let viewer_path = temporary_output_path("wav");
+    let encode_error = |message: String| DecayError::AudioEncode {
+        context: format!(
+            "open: encode playback wav '{}': {}",
+            viewer_path.display(),
+            message
+        ),
+    };
+
+    let wav_spec = hound::WavSpec {
+        channels: u16::from(spec.channels),
+        sample_rate: spec.sample_rate,
+        bits_per_sample: u16::from(spec.bits_per_sample),
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&viewer_path, wav_spec)
+        .map_err(|error| encode_error(error.to_string()))?;
+    for sample in payload.chunks_exact(AUDIO_BYTES_PER_SAMPLE) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]);
+        writer
+            .write_sample(value)
+            .map_err(|error| encode_error(error.to_string()))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| encode_error(error.to_string()))?;
+
+    open_in_default_app(&viewer_path)
+}
+
 /// Builds a unique path in the system temp directory for a display file with the
 /// given extension. The viewer is launched asynchronously so this file cannot be
 /// deleted immediately; instead every open sweeps the previous ones via
@@ -190,11 +262,10 @@ fn temporary_output_path(extension: &str) -> PathBuf {
 /// Best-effort removal of the temporary view files left by previous opens.
 ///
 /// Displaying a corrupted payload requires writing it to a temporary file for the
-/// system viewer, and those files linger as snapshots of past decay states. Since the
-/// format's whole point is that there is no recovery to an earlier state, the tool
-/// must not quietly leave recoverable copies of less-corrupted states lying around. On
-/// each open we sweep the old ones. Failures are ignored: a file still held open by a
-/// viewer simply survives until the next run.
+/// system viewer, and those files persist as copies of earlier, less-corrupted payload
+/// states. Each open sweeps the previous ones so those copies do not accumulate.
+/// Failures are ignored: a file still held open by a viewer simply survives until the
+/// next run.
 fn cleanup_old_view_files() {
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for entry in entries.flatten() {
@@ -212,8 +283,7 @@ fn cleanup_old_view_files() {
 ///
 /// Each platform exposes a different one-shot "open with the default application"
 /// command. The application is spawned and not waited on, so it stays open after
-/// this returns. A failure to launch is reported, though by this point the
-/// corruption has already been written to disk.
+/// this returns. A failure to launch is reported as an error.
 fn open_in_default_app(path: &Path) -> Result<(), DecayError> {
     let spawn_result = if cfg!(target_os = "windows") {
         // On Windows, start is a cmd builtin; its first quoted argument is treated
@@ -253,39 +323,95 @@ mod tests {
         std::env::temp_dir().join(format!("decayfmt_open_test_{}_{}", nanos, suffix))
     }
 
+    /// Builds a minimal 16-bit PCM WAV in memory so the audio tests do not need a
+    /// fixture file on disk. `frames` is the number of samples per channel.
+    fn wav_bytes(sample_rate: u32, channels: u16, frames: u32) -> Vec<u8> {
+        let data_len = frames * u32::from(channels) * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * u32::from(channels) * 2).to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            for _ in 0..channels {
+                // A ramp rather than silence, so a corrupted byte is a changed byte.
+                let sample = (frame % 30_000) as i16;
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
     #[test]
     fn open_changes_the_payload_but_never_the_header_on_disk() {
-        // Encode a text file, capture its clean payload and header, open it, then
-        // confirm the payload bytes on disk changed while the header bytes did not.
-        let source = vec![b'a'; 4096];
-        let input = unique_temp_path("source.txt");
-        let decay_file = unique_temp_path("note.tdcy5");
-        fs::write(&input, &source).expect("write test source");
-        encode_file(&input, &decay_file).expect("encode should succeed");
+        // The core of the format: decay is written to disk, the header is untouched,
+        // and length is preserved. Checked for a text file and an audio file, since
+        // audio must also keep its duration, sample rate, and channel count.
+        let text_source = unique_temp_path("source.txt");
+        fs::write(&text_source, vec![b'a'; 4096]).expect("write test source");
+        let audio_source = unique_temp_path("source.wav");
+        fs::write(&audio_source, wav_bytes(22_050, 1, 4_000)).expect("write test wav");
 
-        let before = fs::read(&decay_file).expect("read encoded file");
-        let header_before = before[..HEADER_SIZE].to_vec();
-        let payload_before = before[HEADER_SIZE..].to_vec();
+        for (source, name) in [(&text_source, "note.tdcy5"), (&audio_source, "clip.adcy10")] {
+            let decay_file = unique_temp_path(name);
+            encode_file(source, &decay_file).expect("encode should succeed");
 
-        // decay_in_place is the persisted half of open, without the display step,
-        // so the test exercises the corruption write without spawning a viewer.
-        decay_in_place(&decay_file).expect("decay should succeed");
+            let before = fs::read(&decay_file).expect("read encoded file");
+            // decay_in_place is the persisted half of open, without the display step,
+            // so the test exercises the corruption write without spawning a viewer.
+            decay_in_place(&decay_file).expect("decay should succeed");
+            let after = fs::read(&decay_file).expect("read opened file");
 
-        let after = fs::read(&decay_file).expect("read opened file");
+            assert_eq!(
+                &after[..HEADER_SIZE],
+                &before[..HEADER_SIZE],
+                "{name}: the header bytes on disk must be untouched by open"
+            );
+            assert_ne!(
+                &after[HEADER_SIZE..],
+                &before[HEADER_SIZE..],
+                "{name}: payload must differ on disk after open"
+            );
+            assert_eq!(
+                after.len(),
+                before.len(),
+                "{name}: in-place payload overwrite must not change the file length"
+            );
+
+            let _ = fs::remove_file(&decay_file);
+        }
+
+        let _ = fs::remove_file(&text_source);
+        let _ = fs::remove_file(&audio_source);
+    }
+
+    #[test]
+    fn audio_round_trip_preserves_spec_and_payload_length() {
+        // The encoded payload must be exactly the source PCM, and the header must
+        // carry back the sample rate and channel count needed to play it.
+        let input = unique_temp_path("source.wav");
+        let decay_file = unique_temp_path("clip.adcy3");
+        fs::write(&input, wav_bytes(44_100, 2, 1_000)).expect("write test wav");
+        encode_file(&input, &decay_file).expect("encode audio should succeed");
+
+        let encoded = fs::read(&decay_file).expect("read encoded file");
+        let header = Header::read(&encoded).expect("audio header must parse");
+        let spec = header.audio_spec().expect("audio header must carry a spec");
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.bits_per_sample, AUDIO_BITS_PER_SAMPLE);
         assert_eq!(
-            &after[..HEADER_SIZE],
-            header_before.as_slice(),
-            "the header bytes on disk must be untouched by open"
-        );
-        assert_ne!(
-            &after[HEADER_SIZE..],
-            payload_before.as_slice(),
-            "payload must differ on disk after open"
-        );
-        assert_eq!(
-            after.len(),
-            before.len(),
-            "in-place payload overwrite must not change the file length"
+            encoded.len() - HEADER_SIZE,
+            1_000 * 2 * AUDIO_BYTES_PER_SAMPLE,
+            "payload must be exactly the decoded PCM, every frame of it"
         );
 
         let _ = fs::remove_file(&input);
