@@ -64,8 +64,11 @@ jobs:
           path: target/wheels
           merge-multiple: true
       - name: publish
+        # `upload` takes the built wheels directly. `publish` would rebuild from a
+        # manifest, which this job does not have: it only downloads the artifacts the
+        # test matrix produced and never checks the repository out.
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: latest
-          command: publish
-          args: --manifest-path python/Cargo.toml --skip-existing
+          command: upload
+          args: --skip-existing target/wheels/*
