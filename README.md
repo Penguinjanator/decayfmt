@@ -105,6 +105,9 @@ There is no runtime dependency to install.
 On macOS the binary is unsigned, so the first run may be blocked by Gatekeeper. Right-click
 it and choose Open, or clear the quarantine flag with `xattr -d com.apple.quarantine decayfmt`.
 
+On Windows the released binary requires Windows 10 or later. Older versions fail to start
+with a missing `api-ms-win-core-synch-l1-2-0.dll`.
+
 ### From source
 
 Requires a Rust toolchain.
