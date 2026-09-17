@@ -2,12 +2,14 @@ name: release
 
 # Build and publish binaries when a version tag is pushed. Each target is built on
 # a native runner, tested, packaged, and attached to the GitHub Release for the tag.
+# Once every target has passed, the crate is published to crates.io.
 on:
   push:
     tags:
       - "v*"
 
-# The release upload needs permission to write to the repository's releases.
+# The release upload needs permission to write to the repository's releases. The
+# publish job requests its own id-token permission, since it needs an OIDC token.
 permissions:
   contents: write
 
@@ -56,3 +58,32 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: decayfmt-${{ matrix.target }}.*
+
+  publish:
+    name: publish to crates.io
+    # Only after every target has built and tested, so a failing platform stops the
+    # publish. A crates.io version can never be reused, unlike a GitHub release.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to request the OIDC token that crates.io exchanges for a
+      # short-lived publish token. No API token is stored in the repository.
+      id-token: write
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: publish
+        # The workspace contains decayfmt-py, which is publish = false and ships to
+        # PyPI instead, so only the root crate is published here.
+        run: cargo publish --package decayfmt
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
