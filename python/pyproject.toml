@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "decayfmt-py"
-version = "0.1.0"
+version = "0.2.0"
 description = "A file format where decay is a first-class property. Every open permanently corrupts the file. Python bindings for the decayfmt CLI format."
 readme = "README.md"
 requires-python = ">=3.11"
