@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 
+from pathlib import Path
+
 import decayfmt
 
 
@@ -20,8 +22,21 @@ def changed_fraction(before, after):
     return sum(a != b for a, b in zip(before, after)) / len(before)
 
 
+def expected_version():
+    """Reads the version from python/Cargo.toml, the manifest the wheel is built from.
+
+    Hardcoding it here means every release breaks the smoke test until someone
+    remembers to edit this file too, so it is read from the manifest instead.
+    """
+    manifest = Path(__file__).resolve().parent.parent / "Cargo.toml"
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if line.startswith("version"):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"no version found in {manifest}")
+
+
 def main():
-    assert decayfmt.__version__ == "0.1.0", decayfmt.__version__
+    assert decayfmt.__version__ == expected_version(), decayfmt.__version__
     print("PASS import + __version__")
 
     # --- corrupt_bytes: statistical behavior through Python ----------------

@@ -252,6 +252,10 @@ fn play_audio(payload: &[u8], spec: AudioSpec) -> Result<(), DecayError> {
     };
     let mut writer = hound::WavWriter::create(&viewer_path, wav_spec)
         .map_err(|error| encode_error(error.to_string()))?;
+    // `chunks_exact_to_as_chunks` suggests `slice::as_chunks`, which is stable only from
+    // Rust 1.88; `chunks_exact` keeps the minimum supported Rust version low, matching
+    // the same choice made in corrupt.rs.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for sample in payload.chunks_exact(AUDIO_BYTES_PER_SAMPLE) {
         let value = i16::from_le_bytes([sample[0], sample[1]]);
         writer
