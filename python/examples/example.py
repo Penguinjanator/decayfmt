@@ -74,7 +74,7 @@ print(f"encode_file: wrote clean decayfmt file to {output.name}")
 print()
 
 # ---------------------------------------------------------------------------
-# decay_file: open without display — PERMANENTLY corrupts the file on disk
+# decay_file: open without display; corrupts the file on disk
 # ---------------------------------------------------------------------------
 kind, dims, file_bytes = decayfmt.decay_file(str(output))
 print(f"decay_file: kind={kind!r}, dims={dims}, first 16 bytes = header")
@@ -148,7 +148,7 @@ show_exception(
     lambda: decayfmt.encode_bytes(b"definitely not a png", str(bad_png)),
 )
 
-# ValueError: wrong magic bytes — the name fits, the contents are not a decayfmt file
+# ValueError: wrong magic bytes; the name fits, the contents are not a decayfmt file
 not_decayfmt = tmp / "fake.tdcy3"
 not_decayfmt.write_text("just a text file")
 show_exception("decay_file(wrong magic)", lambda: decayfmt.decay_file(str(not_decayfmt)))
@@ -159,13 +159,13 @@ decayfmt.encode_bytes(png, str(photo_out))
 Path(str(photo_out)).rename(mismatched)
 show_exception("decay_file(type mismatch)", lambda: decayfmt.decay_file(str(mismatched)))
 
-# OSError: filesystem failure — source does not exist
+# OSError: filesystem failure; source does not exist
 show_exception(
     "encode_file(missing source)",
     lambda: decayfmt.encode_file(str(tmp / "nope.txt"), str(tmp / "out.tdcy3")),
 )
 
-# PermissionError: read-only target is refused (opening must cost a corruption)
+# PermissionError: read-only target is refused (corruption cannot be written back)
 readonly = tmp / "locked.tdcy3"
 decayfmt.encode_file(str(source), str(readonly))
 readonly.chmod(0o444)
