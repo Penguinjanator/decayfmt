@@ -1,0 +1,35 @@
+version: 2
+
+# Dependabot opens a pull request when a dependency updates, and the existing ci and
+# python workflows run against it. Monthly rather than weekly: with seven direct crates
+# and a handful of actions, anything more frequent is noise.
+updates:
+  # The workspace covers both the root crate and python/, so one entry handles both.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps land together in one pull request, so a month of routine
+      # drift is a single review rather than five.
+      routine:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # rand is load bearing for the corruption invariant, and 0.9 renamed the generator
+      # entry points. Upgrade deliberately, not because a version number moved.
+      - dependency-name: rand
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"

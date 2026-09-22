@@ -40,6 +40,16 @@ release. See [python/RELEASE.md](python/RELEASE.md).
    pip install -U decayfmt-py && python python/tests/smoke.py
    ```
 
+## Dependencies
+
+Dependabot opens a pull request each month when crates or actions update, grouped so a
+month of routine drift is one review. CI runs against every one, so merging a green pull
+request is the whole process. Major bumps come as their own pull request; `rand` is
+excluded from those because the corruption invariant depends on it.
+
+Before cutting a release, run `cargo update` and commit the lockfile with the release.
+That catches drift at the one moment everything is being tested anyway.
+
 ## Publishing setup
 
 Both registries use trusted publishing: a GitHub OIDC token is exchanged for a
